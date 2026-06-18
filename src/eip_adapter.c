@@ -53,6 +53,31 @@ static int  g_to_run_idle = 0;   /* prepend 32-bit run/idle header on T->O */
 static int  g_loopback   = 1;    /* mirror consumed O->T bytes into T->O   */
 static uint16_t g_out_inst = ASM_OUTPUT_INST;
 static uint16_t g_in_inst  = ASM_INPUT_INST;
+static uint16_t g_cfg_inst = ASM_CONFIG_INST;
+
+/* ---- network binding ---- */
+static uint32_t g_bind_be  = INADDR_ANY;  /* socket bind address (network order) */
+
+/* ---- I/O size policy: 0 = accept whatever the originator requests ---- */
+static uint16_t g_exp_out_size = 0;       /* expected O->T (consumed) bytes      */
+static uint16_t g_exp_in_size  = 0;       /* expected T->O (produced) bytes      */
+
+/* ---- RPI acceptance bounds (microseconds): 0 = no limit ---- */
+static uint32_t g_rpi_min_us = 0;
+static uint32_t g_rpi_max_us = 0;
+
+/* ---- inactivity timeout override (microseconds): 0 = derive from FO ---- */
+static uint32_t g_timeout_us = 0;
+
+/* ---- Identity object (runtime-configurable; defaults from device.h) ---- */
+static uint16_t g_vendor_id    = DEV_VENDOR_ID;
+static uint16_t g_device_type  = DEV_DEVICE_TYPE;
+static uint16_t g_product_code = DEV_PRODUCT_CODE;
+static uint8_t  g_rev_major    = DEV_REV_MAJOR;
+static uint8_t  g_rev_minor    = DEV_REV_MINOR;
+static uint16_t g_dev_status   = DEV_STATUS;
+static uint32_t g_serial       = DEV_SERIAL;
+static char     g_product_name[64] = DEV_PRODUCT_NAME;
 
 static void logmsg(const char *fmt, ...) {
     if (!g_verbose) return;
@@ -170,23 +195,23 @@ static int handle_explicit(uint8_t service, uint16_t class_id, uint32_t inst,
 
     if (class_id == CLASS_IDENTITY && inst == 1) {
         if (service == CIP_GET_ATTR_ALL) {
-            put_u16(p, DEV_VENDOR_ID);    p += 2;
-            put_u16(p, DEV_DEVICE_TYPE);  p += 2;
-            put_u16(p, DEV_PRODUCT_CODE); p += 2;
-            *p++ = DEV_REV_MAJOR; *p++ = DEV_REV_MINOR;
-            put_u16(p, DEV_STATUS);       p += 2;
-            put_u32(p, DEV_SERIAL);       p += 4;
-            p += put_short_string(p, DEV_PRODUCT_NAME);
+            put_u16(p, g_vendor_id);    p += 2;
+            put_u16(p, g_device_type);  p += 2;
+            put_u16(p, g_product_code); p += 2;
+            *p++ = g_rev_major; *p++ = g_rev_minor;
+            put_u16(p, g_dev_status);   p += 2;
+            put_u32(p, g_serial);       p += 4;
+            p += put_short_string(p, g_product_name);
             n = (int)(p - resp);
         } else if (service == CIP_GET_ATTR_SINGLE) {
             switch (attr) {
-            case 1: put_u16(p, DEV_VENDOR_ID);    p += 2; break;
-            case 2: put_u16(p, DEV_DEVICE_TYPE);  p += 2; break;
-            case 3: put_u16(p, DEV_PRODUCT_CODE); p += 2; break;
-            case 4: *p++ = DEV_REV_MAJOR; *p++ = DEV_REV_MINOR; break;
-            case 5: put_u16(p, DEV_STATUS);       p += 2; break;
-            case 6: put_u32(p, DEV_SERIAL);       p += 4; break;
-            case 7: p += put_short_string(p, DEV_PRODUCT_NAME); break;
+            case 1: put_u16(p, g_vendor_id);    p += 2; break;
+            case 2: put_u16(p, g_device_type);  p += 2; break;
+            case 3: put_u16(p, g_product_code); p += 2; break;
+            case 4: *p++ = g_rev_major; *p++ = g_rev_minor; break;
+            case 5: put_u16(p, g_dev_status);   p += 2; break;
+            case 6: put_u32(p, g_serial);       p += 4; break;
+            case 7: p += put_short_string(p, g_product_name); break;
             default: gstatus = CIP_STATUS_ATTR_UNSUPPORTED; break;
             }
             n = (int)(p - resp);
@@ -261,6 +286,30 @@ static uint16_t conn_param_size(uint32_t params, int large) {
 
 static uint32_t g_next_cid = 0x20000001;
 
+/* Connection Manager extended status codes for an unsuccessful Forward Open */
+#define CM_EXT_RPI_NOT_SUPPORTED 0x0111
+#define CM_EXT_CONN_LIMIT        0x0113
+#define CM_EXT_INVALID_OT_SIZE   0x0127
+#define CM_EXT_INVALID_TO_SIZE   0x0128
+
+/* Build an unsuccessful Forward Open response carrying an extended status. */
+static int fo_error(int large, uint16_t ext, uint16_t serial,
+                    uint16_t vid, uint32_t osn, uint8_t *resp)
+{
+    resp[0] = (large ? CIP_LARGE_FORWARD_OPEN : CIP_FORWARD_OPEN) | CIP_REPLY_MASK;
+    resp[1] = 0;
+    resp[2] = 0x01;        /* general status: connection failure          */
+    resp[3] = 1;           /* additional status size = 1 word             */
+    uint8_t *r = resp + 4;
+    put_u16(r, ext);    r += 2;   /* extended status                      */
+    put_u16(r, serial); r += 2;   /* unsuccessful-response fields follow  */
+    put_u16(r, vid);    r += 2;
+    put_u32(r, osn);    r += 4;
+    *r++ = 0;  /* remaining path size */
+    *r++ = 0;  /* reserved */
+    return (int)(r - resp);
+}
+
 /*
  * Parse and service a Forward Open request body (the bytes after the MR
  * request path).  'peer_ip' is the TCP peer (originator) address used as the
@@ -293,14 +342,30 @@ static int do_forward_open(int large, const uint8_t *d, int dl,
     uint16_t ot_size = conn_param_size(ot_par, large);
     uint16_t to_size = conn_param_size(to_par, large);
 
+    /* ---- validate request against the adapter's configured policy ---- */
+    if (g_rpi_min_us && (ot_rpi < g_rpi_min_us || to_rpi < g_rpi_min_us)) {
+        logmsg("Forward Open rejected: RPI below minimum (%u us)", g_rpi_min_us);
+        return fo_error(large, CM_EXT_RPI_NOT_SUPPORTED, serial, vid, osn, resp);
+    }
+    if (g_rpi_max_us && (ot_rpi > g_rpi_max_us || to_rpi > g_rpi_max_us)) {
+        logmsg("Forward Open rejected: RPI above maximum (%u us)", g_rpi_max_us);
+        return fo_error(large, CM_EXT_RPI_NOT_SUPPORTED, serial, vid, osn, resp);
+    }
+    if (g_exp_out_size && ot_size != g_exp_out_size) {
+        logmsg("Forward Open rejected: O->T size %u != expected %u", ot_size, g_exp_out_size);
+        return fo_error(large, CM_EXT_INVALID_OT_SIZE, serial, vid, osn, resp);
+    }
+    if (g_exp_in_size && to_size != g_exp_in_size) {
+        logmsg("Forward Open rejected: T->O size %u != expected %u", to_size, g_exp_in_size);
+        return fo_error(large, CM_EXT_INVALID_TO_SIZE, serial, vid, osn, resp);
+    }
+
     /* If a connection with this triple already exists, treat as re-open */
     conn_t *c = conn_find_by_serial(serial, vid, osn);
     if (!c) c = conn_alloc();
     if (!c) {
-        /* no resources */
-        resp[0] = (large ? CIP_LARGE_FORWARD_OPEN : CIP_FORWARD_OPEN) | CIP_REPLY_MASK;
-        resp[1] = 0; resp[2] = 0x02; resp[3] = 0; /* resource unavailable */
-        return 4;
+        logmsg("Forward Open rejected: connection limit reached");
+        return fo_error(large, CM_EXT_CONN_LIMIT, serial, vid, osn, resp);
     }
 
     c->active       = 1;
@@ -314,7 +379,7 @@ static int do_forward_open(int large, const uint8_t *d, int dl,
     c->ot_size      = ot_size > sizeof(c->ot_data) ? sizeof(c->ot_data) : ot_size;
     c->to_size      = to_size > sizeof(c->to_data) ? sizeof(c->to_data) : to_size;
     c->conn_tmo_mult= tmo_mult;
-    c->timeout_us   = ot_rpi * tmo_mult_value(tmo_mult);
+    c->timeout_us   = g_timeout_us ? g_timeout_us : ot_rpi * tmo_mult_value(tmo_mult);
     c->to_seq32     = 0;
     c->to_seq16     = 0;
     c->prod_counter = 0;
@@ -544,13 +609,13 @@ static int build_list_identity_item(uint8_t *out) {
     put_u16be(p, EIP_TCP_PORT); p += 2;
     memcpy(p, &g_my_ip_be, 4);  p += 4;
     memset(p, 0, 8);            p += 8;
-    put_u16(p, DEV_VENDOR_ID);    p += 2;
-    put_u16(p, DEV_DEVICE_TYPE);  p += 2;
-    put_u16(p, DEV_PRODUCT_CODE); p += 2;
-    *p++ = DEV_REV_MAJOR; *p++ = DEV_REV_MINOR;
-    put_u16(p, DEV_STATUS);       p += 2;
-    put_u32(p, DEV_SERIAL);       p += 4;
-    p += put_short_string(p, DEV_PRODUCT_NAME);
+    put_u16(p, g_vendor_id);    p += 2;
+    put_u16(p, g_device_type);  p += 2;
+    put_u16(p, g_product_code); p += 2;
+    *p++ = g_rev_major; *p++ = g_rev_minor;
+    put_u16(p, g_dev_status);   p += 2;
+    put_u32(p, g_serial);       p += 4;
+    p += put_short_string(p, g_product_name);
     *p++ = 0xFF;                           /* state */
 
     put_u16(itlen, (uint16_t)(p - start));
@@ -640,7 +705,7 @@ static int make_tcp_listener(uint16_t port) {
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     struct sockaddr_in a = {0};
-    a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY; a.sin_port = htons(port);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = g_bind_be; a.sin_port = htons(port);
     if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { close(fd); return -1; }
     if (listen(fd, 8) < 0) { close(fd); return -1; }
     return fd;
@@ -652,7 +717,7 @@ static int make_udp_socket(uint16_t port) {
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
     struct sockaddr_in a = {0};
-    a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY; a.sin_port = htons(port);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = g_bind_be; a.sin_port = htons(port);
     if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { close(fd); return -1; }
     return fd;
 }
@@ -663,41 +728,103 @@ static void on_signal(int s) { (void)s; g_run = 0; }
 /* main                                                                       */
 /* -------------------------------------------------------------------------- */
 
+/* long-only option ids */
+enum {
+    OPT_CFG_INST = 1000, OPT_OUT_SIZE, OPT_IN_SIZE,
+    OPT_RPI_MIN, OPT_RPI_MAX, OPT_TIMEOUT,
+    OPT_VENDOR, OPT_DEVTYPE, OPT_PRODCODE, OPT_SERIAL, OPT_NAME, OPT_REV
+};
+
 static void usage(const char *prog) {
     printf("Usage: %s [options]\n"
            "EtherNet/IP adapter with Class 1 implicit I/O.\n\n"
+           "Network / addressing:\n"
            "  --ip A.B.C.D        advertise this IP in ListIdentity\n"
+           "  --bind A.B.C.D      bind sockets to this address (default 0.0.0.0)\n"
+           "\nAssembly instances:\n"
+           "  --out-inst N        output (O->T) assembly instance (default %d)\n"
+           "  --in-inst N         input  (T->O) assembly instance (default %d)\n"
+           "  --cfg-inst N        configuration assembly instance (default %d)\n"
+           "\nClass 1 connection policy (validated against Forward Open):\n"
+           "  --out-size N        require O->T (consumed) size = N bytes\n"
+           "  --in-size N         require T->O (produced) size = N bytes\n"
+           "  --rpi-min-ms N      reject Forward Open with RPI below N ms\n"
+           "  --rpi-max-ms N      reject Forward Open with RPI above N ms\n"
+           "  --timeout-ms N      override O->T inactivity timeout (else RPI*mult)\n"
+           "\nReal-time format / behaviour:\n"
            "  --no-ot-run-idle    O->T data has NO 32-bit run/idle header\n"
            "  --to-run-idle       prepend 32-bit run/idle header on T->O\n"
            "  --no-loopback       do not mirror O->T into T->O payload\n"
-           "  --out-inst N        output (O->T) assembly instance (default %d)\n"
-           "  --in-inst N         input  (T->O) assembly instance (default %d)\n"
+           "\nIdentity object (numbers accept 0x.. hex):\n"
+           "  --vendor-id N       vendor id        (default 0x%04x)\n"
+           "  --device-type N     device type      (default %u)\n"
+           "  --product-code N    product code     (default 0x%04x)\n"
+           "  --serial N          serial number    (default 0x%08x)\n"
+           "  --rev MAJOR.MINOR   revision         (default %u.%u)\n"
+           "  --product-name STR  product name     (default \"%s\")\n"
+           "\nMisc:\n"
            "  --quiet             reduce logging\n"
            "  --help              this help\n",
-           prog, ASM_OUTPUT_INST, ASM_INPUT_INST);
+           prog, ASM_OUTPUT_INST, ASM_INPUT_INST, ASM_CONFIG_INST,
+           DEV_VENDOR_ID, DEV_DEVICE_TYPE, DEV_PRODUCT_CODE, DEV_SERIAL,
+           DEV_REV_MAJOR, DEV_REV_MINOR, DEV_PRODUCT_NAME);
 }
 
 int main(int argc, char **argv) {
     static struct option opts[] = {
         {"ip",             required_argument, 0, 'i'},
+        {"bind",           required_argument, 0, 'b'},
         {"no-ot-run-idle", no_argument,       0, 'r'},
         {"to-run-idle",    no_argument,       0, 't'},
         {"no-loopback",    no_argument,       0, 'l'},
         {"out-inst",       required_argument, 0, 'o'},
         {"in-inst",        required_argument, 0, 'n'},
+        {"cfg-inst",       required_argument, 0, OPT_CFG_INST},
+        {"out-size",       required_argument, 0, OPT_OUT_SIZE},
+        {"in-size",        required_argument, 0, OPT_IN_SIZE},
+        {"rpi-min-ms",     required_argument, 0, OPT_RPI_MIN},
+        {"rpi-max-ms",     required_argument, 0, OPT_RPI_MAX},
+        {"timeout-ms",     required_argument, 0, OPT_TIMEOUT},
+        {"vendor-id",      required_argument, 0, OPT_VENDOR},
+        {"device-type",    required_argument, 0, OPT_DEVTYPE},
+        {"product-code",   required_argument, 0, OPT_PRODCODE},
+        {"serial",         required_argument, 0, OPT_SERIAL},
+        {"product-name",   required_argument, 0, OPT_NAME},
+        {"rev",            required_argument, 0, OPT_REV},
         {"quiet",          no_argument,       0, 'q'},
         {"help",           no_argument,       0, 'h'},
         {0,0,0,0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "i:rtlo:n:qh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:b:rtlo:n:qh", opts, NULL)) != -1) {
         switch (c) {
         case 'i': g_my_ip_be = inet_addr(optarg); break;
+        case 'b': g_bind_be  = inet_addr(optarg); break;
         case 'r': g_ot_run_idle = 0; break;
         case 't': g_to_run_idle = 1; break;
         case 'l': g_loopback = 0; break;
-        case 'o': g_out_inst = (uint16_t)atoi(optarg); break;
-        case 'n': g_in_inst  = (uint16_t)atoi(optarg); break;
+        case 'o': g_out_inst = (uint16_t)strtol(optarg, NULL, 0); break;
+        case 'n': g_in_inst  = (uint16_t)strtol(optarg, NULL, 0); break;
+        case OPT_CFG_INST: g_cfg_inst = (uint16_t)strtol(optarg, NULL, 0); break;
+        case OPT_OUT_SIZE: g_exp_out_size = (uint16_t)strtol(optarg, NULL, 0); break;
+        case OPT_IN_SIZE:  g_exp_in_size  = (uint16_t)strtol(optarg, NULL, 0); break;
+        case OPT_RPI_MIN:  g_rpi_min_us = (uint32_t)strtol(optarg, NULL, 0) * 1000; break;
+        case OPT_RPI_MAX:  g_rpi_max_us = (uint32_t)strtol(optarg, NULL, 0) * 1000; break;
+        case OPT_TIMEOUT:  g_timeout_us = (uint32_t)strtol(optarg, NULL, 0) * 1000; break;
+        case OPT_VENDOR:   g_vendor_id    = (uint16_t)strtol(optarg, NULL, 0); break;
+        case OPT_DEVTYPE:  g_device_type  = (uint16_t)strtol(optarg, NULL, 0); break;
+        case OPT_PRODCODE: g_product_code = (uint16_t)strtol(optarg, NULL, 0); break;
+        case OPT_SERIAL:   g_serial       = (uint32_t)strtol(optarg, NULL, 0); break;
+        case OPT_NAME:
+            strncpy(g_product_name, optarg, sizeof(g_product_name) - 1);
+            g_product_name[sizeof(g_product_name) - 1] = '\0';
+            break;
+        case OPT_REV: {
+            int mj = 1, mn = 1;
+            sscanf(optarg, "%d.%d", &mj, &mn);
+            g_rev_major = (uint8_t)mj; g_rev_minor = (uint8_t)mn;
+            break;
+        }
         case 'q': g_verbose = 0; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
@@ -718,11 +845,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    logmsg("EtherNet/IP adapter '%s' ready", DEV_PRODUCT_NAME);
+    logmsg("EtherNet/IP adapter '%s' ready (vendor=0x%04x dev_type=%u "
+           "prod=0x%04x rev=%u.%u serial=0x%08x)",
+           g_product_name, g_vendor_id, g_device_type, g_product_code,
+           g_rev_major, g_rev_minor, g_serial);
     logmsg("  TCP %d (explicit), UDP %d (discovery), UDP %d (Class 1 I/O)",
            EIP_TCP_PORT, EIP_UDP_PORT, EIP_IO_PORT);
+    logmsg("  assemblies: O->T(out)=%u T->O(in)=%u config=%u",
+           g_out_inst, g_in_inst, g_cfg_inst);
     logmsg("  O->T run/idle=%d  T->O run/idle=%d  loopback=%d",
            g_ot_run_idle, g_to_run_idle, g_loopback);
+    if (g_exp_out_size || g_exp_in_size)
+        logmsg("  size policy: O->T=%u T->O=%u (Forward Open must match)",
+               g_exp_out_size, g_exp_in_size);
+    if (g_rpi_min_us || g_rpi_max_us)
+        logmsg("  RPI policy: min=%uus max=%uus", g_rpi_min_us, g_rpi_max_us);
+    if (g_timeout_us)
+        logmsg("  timeout override: %u us", g_timeout_us);
 
     tcp_client_t clients[MAX_TCP_CLIENTS];
     memset(clients, 0, sizeof(clients));

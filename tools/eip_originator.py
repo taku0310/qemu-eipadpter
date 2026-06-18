@@ -112,9 +112,11 @@ def forward_open(sock, session, ot_cid, ot_rpi_us, to_rpi_us,
         off += l
     if mr_resp is None:
         raise RuntimeError("no MR response in ForwardOpen reply")
-    svc, _, gstatus = mr_resp[0], mr_resp[1], mr_resp[2]
+    svc, _, gstatus, addl = mr_resp[0], mr_resp[1], mr_resp[2], mr_resp[3]
     if gstatus != 0:
-        raise RuntimeError("ForwardOpen CIP status=0x%x" % gstatus)
+        ext = struct.unpack_from("<H", mr_resp, 4)[0] if addl >= 1 else 0
+        raise RuntimeError("ForwardOpen rejected: CIP status=0x%02x "
+                           "extended=0x%04x" % (gstatus, ext))
     ot_id, to_id = struct.unpack_from("<II", mr_resp, 4)
     return ot_id, to_id
 
