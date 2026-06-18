@@ -78,6 +78,8 @@ static uint8_t  g_rev_minor    = DEV_REV_MINOR;
 static uint16_t g_dev_status   = DEV_STATUS;
 static uint32_t g_serial       = DEV_SERIAL;
 static char     g_product_name[64] = DEV_PRODUCT_NAME;
+static char     g_vendor_name[64]  = "QEMU";
+static uint32_t g_rpi_default_us   = 10000;  /* RPI advertised in EDS */
 
 static void logmsg(const char *fmt, ...) {
     if (!g_verbose) return;
@@ -725,6 +727,184 @@ static int make_udp_socket(uint16_t port) {
 static void on_signal(int s) { (void)s; g_run = 0; }
 
 /* -------------------------------------------------------------------------- */
+/* configuration file (INI-style key = value)                                 */
+/* -------------------------------------------------------------------------- */
+
+static char *trim(char *s) {
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    char *e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n'))
+        *--e = '\0';
+    return s;
+}
+
+static void set_str(char *dst, size_t n, const char *v) {
+    /* strip optional surrounding quotes */
+    if (*v == '"') { v++; }
+    strncpy(dst, v, n - 1);
+    dst[n - 1] = '\0';
+    char *q = strchr(dst, '"');
+    if (q) *q = '\0';
+}
+
+/* Apply a single key=value setting (used by the config file). */
+static int set_param(const char *k, const char *v) {
+    if      (!strcmp(k, "bind"))         g_bind_be = inet_addr(v);
+    else if (!strcmp(k, "ip"))           g_my_ip_be = inet_addr(v);
+    else if (!strcmp(k, "out_inst"))     g_out_inst = (uint16_t)strtol(v, NULL, 0);
+    else if (!strcmp(k, "in_inst"))      g_in_inst = (uint16_t)strtol(v, NULL, 0);
+    else if (!strcmp(k, "cfg_inst"))     g_cfg_inst = (uint16_t)strtol(v, NULL, 0);
+    else if (!strcmp(k, "out_size"))     g_exp_out_size = (uint16_t)strtol(v, NULL, 0);
+    else if (!strcmp(k, "in_size"))      g_exp_in_size = (uint16_t)strtol(v, NULL, 0);
+    else if (!strcmp(k, "rpi_min_ms"))   g_rpi_min_us = (uint32_t)strtol(v, NULL, 0) * 1000;
+    else if (!strcmp(k, "rpi_max_ms"))   g_rpi_max_us = (uint32_t)strtol(v, NULL, 0) * 1000;
+    else if (!strcmp(k, "rpi_ms"))       g_rpi_default_us = (uint32_t)strtol(v, NULL, 0) * 1000;
+    else if (!strcmp(k, "timeout_ms"))   g_timeout_us = (uint32_t)strtol(v, NULL, 0) * 1000;
+    else if (!strcmp(k, "ot_run_idle"))  g_ot_run_idle = atoi(v);
+    else if (!strcmp(k, "to_run_idle"))  g_to_run_idle = atoi(v);
+    else if (!strcmp(k, "loopback"))     g_loopback = atoi(v);
+    else if (!strcmp(k, "vendor_id"))    g_vendor_id = (uint16_t)strtol(v, NULL, 0);
+    else if (!strcmp(k, "device_type"))  g_device_type = (uint16_t)strtol(v, NULL, 0);
+    else if (!strcmp(k, "product_code")) g_product_code = (uint16_t)strtol(v, NULL, 0);
+    else if (!strcmp(k, "serial"))       g_serial = (uint32_t)strtoul(v, NULL, 0);
+    else if (!strcmp(k, "rev_major"))    g_rev_major = (uint8_t)atoi(v);
+    else if (!strcmp(k, "rev_minor"))    g_rev_minor = (uint8_t)atoi(v);
+    else if (!strcmp(k, "product_name")) set_str(g_product_name, sizeof(g_product_name), v);
+    else if (!strcmp(k, "vendor_name"))  set_str(g_vendor_name, sizeof(g_vendor_name), v);
+    else { fprintf(stderr, "config: unknown key '%s'\n", k); return -1; }
+    return 0;
+}
+
+static int load_config(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "config: cannot open '%s': %s\n", path, strerror(errno)); return -1; }
+    char line[512];
+    int lineno = 0;
+    while (fgets(line, sizeof(line), f)) {
+        lineno++;
+        char *h = strchr(line, '#'); if (h) *h = '\0';   /* comment */
+        h = strchr(line, ';');       if (h) *h = '\0';   /* comment */
+        if (line[0] == '[') continue;                    /* ignore [section] */
+        char *eq = strchr(line, '=');
+        if (!eq) { if (*trim(line)) fprintf(stderr, "config:%d: no '='\n", lineno); continue; }
+        *eq = '\0';
+        char *key = trim(line), *val = trim(eq + 1);
+        if (!*key) continue;
+        set_param(key, val);
+    }
+    fclose(f);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* EDS (Electronic Data Sheet) generation                                     */
+/* -------------------------------------------------------------------------- */
+
+static int write_eds(const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "eds: cannot write '%s': %s\n", path, strerror(errno)); return -1; }
+
+    uint16_t out_size = g_exp_out_size ? g_exp_out_size : ASM_OUTPUT_SIZE;
+    uint16_t in_size  = g_exp_in_size  ? g_exp_in_size  : ASM_INPUT_SIZE;
+    uint32_t rpi_min  = g_rpi_min_us ? g_rpi_min_us : 1000;
+    uint32_t rpi_max  = g_rpi_max_us ? g_rpi_max_us : 10000000;
+    uint32_t rpi_def  = g_rpi_default_us;
+    if (rpi_def < rpi_min) rpi_def = rpi_min;
+    if (rpi_def > rpi_max) rpi_def = rpi_max;
+
+    time_t now = time(NULL);
+    struct tm tm; localtime_r(&now, &tm);
+    char date[16], tstr[16];
+    strftime(date, sizeof(date), "%m-%d-%Y", &tm);
+    strftime(tstr, sizeof(tstr), "%H:%M:%S", &tm);
+
+    fprintf(f,
+        "$ EtherNet/IP Electronic Data Sheet\n"
+        "$ Generated by qemu-eipadpter\n\n"
+        "[File]\n"
+        "        DescText = \"EDS for %s\";\n"
+        "        CreateDate = %s;\n"
+        "        CreateTime = %s;\n"
+        "        ModDate = %s;\n"
+        "        ModTime = %s;\n"
+        "        Revision = 1.1;\n\n",
+        g_product_name, date, tstr, date, tstr);
+
+    fprintf(f,
+        "[Device]\n"
+        "        VendCode = %u;\n"
+        "        VendName = \"%s\";\n"
+        "        ProdType = %u;\n"
+        "        ProdTypeStr = \"Communications Adapter\";\n"
+        "        ProdCode = %u;\n"
+        "        MajRev = %u;\n"
+        "        MinRev = %u;\n"
+        "        ProdName = \"%s\";\n"
+        "        Catalog = \"%s\";\n\n",
+        g_vendor_id, g_vendor_name, g_device_type, g_product_code,
+        g_rev_major, g_rev_minor, g_product_name, g_product_name);
+
+    fprintf(f,
+        "[Device Classification]\n"
+        "        Class1 = EtherNetIP;\n\n");
+
+    /* RPI parameters referenced by the connection */
+    fprintf(f,
+        "[Params]\n"
+        "        Param1 =\n"
+        "                0,,,                       $ reserved, link path size, link path\n"
+        "                0x0000,                    $ descriptor\n"
+        "                0xC8,                      $ data type: UDINT\n"
+        "                4,                         $ data size (bytes)\n"
+        "                \"O2T RPI\",\"microseconds\",\"\",\n"
+        "                %u,%u,%u,                  $ min, max, default\n"
+        "                ,,,,;\n"
+        "        Param2 =\n"
+        "                0,,,\n"
+        "                0x0000,\n"
+        "                0xC8,\n"
+        "                4,\n"
+        "                \"T2O RPI\",\"microseconds\",\"\",\n"
+        "                %u,%u,%u,\n"
+        "                ,,,,;\n\n",
+        rpi_min, rpi_max, rpi_def, rpi_min, rpi_max, rpi_def);
+
+    /* Assembly object: output (O->T consumed) and input (T->O produced) */
+    fprintf(f,
+        "[Assembly]\n"
+        "        Object_Name = \"Assembly Object\";\n"
+        "        Object_Class_Code = 0x04;\n"
+        "        Assem%u =\n"
+        "                \"Output Data (O2T, consumed)\",,%u,\n"
+        "                0x0000,,,;            $ size in BITS\n"
+        "        Assem%u =\n"
+        "                \"Input Data (T2O, produced)\",,%u,\n"
+        "                0x0000,,,;\n"
+        "        Assem%u =\n"
+        "                \"Configuration\",,0,\n"
+        "                0x0000,,,;\n\n",
+        g_out_inst, out_size * 8, g_in_inst, in_size * 8, g_cfg_inst);
+
+    /* Connection Manager: one exclusive-owner Class 1 connection */
+    fprintf(f,
+        "[Connection Manager]\n"
+        "        Connection1 =\n"
+        "                0x84010002,           $ trigger & transport: Class 1, cyclic, O2T+T2O\n"
+        "                0x44640405,           $ params: O2T P2P, T2O P2P, scheduled\n"
+        "                ,Param1,%u,,          $ O2T RPI(param), size(bytes), format\n"
+        "                ,Param2,%u,,          $ T2O RPI(param), size(bytes), format\n"
+        "                ,,                    $ config #1\n"
+        "                ,                     $ config #2\n"
+        "                \"Exclusive Owner\",   $ connection name\n"
+        "                \"\",                  $ help string\n"
+        "                \"20 04 24 %02X 2C %02X 2C %02X\"; $ path: Assembly cfg/O2T/T2O\n\n",
+        out_size, in_size, g_cfg_inst & 0xFF, g_out_inst & 0xFF, g_in_inst & 0xFF);
+
+    fclose(f);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
 /* main                                                                       */
 /* -------------------------------------------------------------------------- */
 
@@ -732,13 +912,17 @@ static void on_signal(int s) { (void)s; g_run = 0; }
 enum {
     OPT_CFG_INST = 1000, OPT_OUT_SIZE, OPT_IN_SIZE,
     OPT_RPI_MIN, OPT_RPI_MAX, OPT_TIMEOUT,
-    OPT_VENDOR, OPT_DEVTYPE, OPT_PRODCODE, OPT_SERIAL, OPT_NAME, OPT_REV
+    OPT_VENDOR, OPT_DEVTYPE, OPT_PRODCODE, OPT_SERIAL, OPT_NAME, OPT_REV,
+    OPT_VENDNAME, OPT_RPI_DEF, OPT_WRITE_EDS
 };
 
 static void usage(const char *prog) {
     printf("Usage: %s [options]\n"
            "EtherNet/IP adapter with Class 1 implicit I/O.\n\n"
-           "Network / addressing:\n"
+           "Configuration file / EDS:\n"
+           "  --config FILE       load settings from an INI-style file (CLI overrides)\n"
+           "  --write-eds FILE    generate an EDS from the config and exit\n"
+           "\nNetwork / addressing:\n"
            "  --ip A.B.C.D        advertise this IP in ListIdentity\n"
            "  --bind A.B.C.D      bind sockets to this address (default 0.0.0.0)\n"
            "\nAssembly instances:\n"
@@ -757,11 +941,13 @@ static void usage(const char *prog) {
            "  --no-loopback       do not mirror O->T into T->O payload\n"
            "\nIdentity object (numbers accept 0x.. hex):\n"
            "  --vendor-id N       vendor id        (default 0x%04x)\n"
+           "  --vendor-name STR   vendor name (EDS) (default \"QEMU\")\n"
            "  --device-type N     device type      (default %u)\n"
            "  --product-code N    product code     (default 0x%04x)\n"
            "  --serial N          serial number    (default 0x%08x)\n"
            "  --rev MAJOR.MINOR   revision         (default %u.%u)\n"
            "  --product-name STR  product name     (default \"%s\")\n"
+           "  --rpi-ms N          RPI advertised in the EDS (default 10)\n"
            "\nMisc:\n"
            "  --quiet             reduce logging\n"
            "  --help              this help\n",
@@ -772,6 +958,8 @@ static void usage(const char *prog) {
 
 int main(int argc, char **argv) {
     static struct option opts[] = {
+        {"config",         required_argument, 0, 'c'},
+        {"write-eds",      required_argument, 0, OPT_WRITE_EDS},
         {"ip",             required_argument, 0, 'i'},
         {"bind",           required_argument, 0, 'b'},
         {"no-ot-run-idle", no_argument,       0, 'r'},
@@ -790,14 +978,31 @@ int main(int argc, char **argv) {
         {"product-code",   required_argument, 0, OPT_PRODCODE},
         {"serial",         required_argument, 0, OPT_SERIAL},
         {"product-name",   required_argument, 0, OPT_NAME},
+        {"vendor-name",    required_argument, 0, OPT_VENDNAME},
         {"rev",            required_argument, 0, OPT_REV},
+        {"rpi-ms",         required_argument, 0, OPT_RPI_DEF},
         {"quiet",          no_argument,       0, 'q'},
         {"help",           no_argument,       0, 'h'},
         {0,0,0,0}
     };
+
+    /* Pre-scan for --config/-c so that command-line flags override the file. */
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "--config")) {
+            if (i + 1 < argc) load_config(argv[i + 1]);
+        } else if (!strncmp(argv[i], "--config=", 9)) {
+            load_config(argv[i] + 9);
+        }
+    }
+
+    const char *eds_path = NULL;
     int c;
-    while ((c = getopt_long(argc, argv, "i:b:rtlo:n:qh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "c:i:b:rtlo:n:qh", opts, NULL)) != -1) {
         switch (c) {
+        case 'c': break; /* already handled in the pre-scan */
+        case OPT_WRITE_EDS: eds_path = optarg; break;
+        case OPT_VENDNAME: set_str(g_vendor_name, sizeof(g_vendor_name), optarg); break;
+        case OPT_RPI_DEF:  g_rpi_default_us = (uint32_t)strtol(optarg, NULL, 0) * 1000; break;
         case 'i': g_my_ip_be = inet_addr(optarg); break;
         case 'b': g_bind_be  = inet_addr(optarg); break;
         case 'r': g_ot_run_idle = 0; break;
@@ -829,6 +1034,13 @@ int main(int argc, char **argv) {
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
+    }
+
+    /* EDS generation is a one-shot action: write and exit. */
+    if (eds_path) {
+        if (write_eds(eds_path) != 0) return 1;
+        printf("EDS written to %s\n", eds_path);
+        return 0;
     }
 
     signal(SIGINT,  on_signal);

@@ -3,5 +3,6 @@
 /build/
 *.o
 *.cpio.gz
+*.eds
 __pycache__/
 *.pyc

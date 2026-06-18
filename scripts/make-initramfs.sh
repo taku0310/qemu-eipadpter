@@ -13,6 +13,7 @@
 #   STATIC_IP CIDR, e.g. 192.168.1.50/24 (used when IP_MODE=static)
 #   GATEWAY   gateway ip               (optional, static mode)
 #   BUSYBOX   path to a busybox binary (default: $(command -v busybox))
+#   CONFIG_FILE   adapter config file to embed at /etc/eip-adapter.conf
 #   ADAPTER_ARGS  extra args passed to eip_adapter (e.g. "--no-ot-run-idle")
 set -eu
 
@@ -23,6 +24,7 @@ IP_MODE="${IP_MODE:-dhcp}"
 STATIC_IP="${STATIC_IP:-192.168.1.50/24}"
 GATEWAY="${GATEWAY:-}"
 BUSYBOX="${BUSYBOX:-$(command -v busybox || true)}"
+CONFIG_FILE="${CONFIG_FILE:-}"
 ADAPTER_ARGS="${ADAPTER_ARGS:-}"
 
 echo ">> Building static adapter binary"
@@ -40,6 +42,15 @@ mkdir -p "$ROOTFS"/bin "$ROOTFS"/sbin "$ROOTFS"/proc "$ROOTFS"/sys "$ROOTFS"/dev
 
 cp "$ROOT/eip_adapter" "$ROOTFS/bin/eip_adapter"
 cp "$BUSYBOX" "$ROOTFS/bin/busybox"
+
+CONFIG_ARG=""
+if [ -n "$CONFIG_FILE" ]; then
+    [ -f "$CONFIG_FILE" ] || { echo "ERROR: CONFIG_FILE '$CONFIG_FILE' not found" >&2; exit 1; }
+    mkdir -p "$ROOTFS/etc"
+    cp "$CONFIG_FILE" "$ROOTFS/etc/eip-adapter.conf"
+    CONFIG_ARG="--config /etc/eip-adapter.conf"
+    echo ">> Embedded config: $CONFIG_FILE -> /etc/eip-adapter.conf"
+fi
 for applet in sh mount ip ifconfig udhcpc ls cat poweroff sleep; do
     ln -sf busybox "$ROOTFS/bin/$applet"
 done
@@ -84,7 +95,7 @@ MYIP=\$(ip -4 addr show eth0 | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -n
 echo "Adapter IP: \$MYIP"
 
 echo ">> starting eip_adapter"
-exec /bin/eip_adapter --ip "\$MYIP" $ADAPTER_ARGS
+exec /bin/eip_adapter $CONFIG_ARG --ip "\$MYIP" $ADAPTER_ARGS
 INIT
 chmod +x "$ROOTFS/init"
 

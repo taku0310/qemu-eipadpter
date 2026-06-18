@@ -244,12 +244,67 @@ Network Connection Parameters から動的に決まり、`--out-size`/`--in-size
 
 ---
 
+## 設定ファイル / Configuration file
+
+すべての設定を INI 形式のファイルにまとめられます（`config/adapter.conf` がサンプル）。
+`key = value` 形式、`#` または `;` 以降はコメント、`[section]` 行は無視されます。
+
+```sh
+./eip_adapter --config config/adapter.conf
+```
+
+**優先順位**: 既定値 < 設定ファイル < コマンドライン引数。
+つまり設定ファイルで基本値を書き、必要な項目だけ CLI で上書きできます。
+
+```sh
+# ファイルの product_name を CLI で上書き
+./eip_adapter --config config/adapter.conf --product-name "Line-A Adapter"
+```
+
+設定キーは CLI のロング名のハイフンをアンダースコアにしたものです
+（`out-size` → `out_size` など）。指定可能なキーは `config/adapter.conf` を参照。
+
+QEMU の initramfs に組み込む場合:
+
+```sh
+CONFIG_FILE=config/adapter.conf sh scripts/make-initramfs.sh
+# -> /etc/eip-adapter.conf として埋め込まれ、--config 付きで起動します
+```
+
+---
+
+## EDS ファイル出力 / EDS generation
+
+現在の設定（アイデンティティ・アセンブリ・サイズ・RPI）から **EDS（Electronic
+Data Sheet）** を生成できます。スキャナ／構成ツール（RSNetWorx, EZ-EDS 等）への
+登録に使用します。
+
+```sh
+# 設定ファイルから生成
+./eip_adapter --config config/adapter.conf --write-eds MyAdapter.eds
+
+# Makefile ターゲット（CONFIG / EDS で変更可）
+make eds                                   # -> QEMU_EIP_Adapter.eds
+make eds CONFIG=config/adapter.conf EDS=out.eds
+```
+
+生成される EDS には `[File]` `[Device]` `[Device Classification]` `[Params]`
+`[Assembly]` `[Connection Manager]` セクションが含まれ、Class 1（Exclusive Owner）
+接続定義（O→T / T→O のサイズ・RPI・接続パス）が記述されます。
+
+> 注: EDS の細かなフィールド（Connection の trigger/transport ビットなど）は
+> 一般的な Exclusive Owner テンプレートに基づいています。製品化の際は EZ-EDS 等の
+> 公式ツールで検証・調整してください。
+
+---
+
 ## 構成 / Layout
 
 ```
 src/eip.h           エンキャプスュレーション / CIP 定数, エンディアン補助
 src/device.h        機器アイデンティティ / アセンブリ定義
-src/eip_adapter.c   本体（TCP/UDP サーバ + Class 1 I/O エンジン）
+src/eip_adapter.c   本体（TCP/UDP サーバ + Class 1 I/O + 設定 / EDS 生成）
+config/adapter.conf       設定ファイルのサンプル
 tools/eip_originator.py   テスト用オリジネータ（スキャナ）
 scripts/make-initramfs.sh QEMU 用 initramfs 生成
 scripts/run-qemu.sh       QEMU 起動
