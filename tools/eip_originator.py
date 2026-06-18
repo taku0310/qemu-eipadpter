@@ -109,14 +109,19 @@ def forward_open(sock, session, ot_cid, ot_rpi_us, to_rpi_us,
     if status != 0:
         raise RuntimeError("SendRRData(ForwardOpen) encap status=0x%x" % status)
 
-    # parse CPF -> MR response
+    # parse CPF -> MR response (+ optional T->O socket address item 0x8001)
     off = 6
     (count,) = struct.unpack_from("<H", body, off); off += 2
     mr_resp = None
+    mcast_addr = None
     for _ in range(count):
         t, l = struct.unpack_from("<HH", body, off); off += 4
+        item = body[off:off + l]
         if t == 0x00B2:
-            mr_resp = body[off:off + l]
+            mr_resp = item
+        elif t == 0x8001 and l >= 8:
+            # sockaddr_in, BIG-endian: family(2) port(2) addr(4) ...
+            mcast_addr = socket.inet_ntoa(item[4:8])
         off += l
     if mr_resp is None:
         raise RuntimeError("no MR response in ForwardOpen reply")
@@ -126,7 +131,7 @@ def forward_open(sock, session, ot_cid, ot_rpi_us, to_rpi_us,
         raise RuntimeError("ForwardOpen rejected: CIP status=0x%02x "
                            "extended=0x%04x" % (gstatus, ext))
     ot_id, to_id = struct.unpack_from("<II", mr_resp, 4)
-    return ot_id, to_id
+    return ot_id, to_id, mcast_addr
 
 
 def forward_close(sock, session, serial, vid, osn, cfg_inst, out_inst, in_inst):
@@ -195,6 +200,10 @@ def main():
                     help="connection serial number (unique per concurrent originator)")
     ap.add_argument("--ot-cid", type=lambda x: int(x, 0), default=0x12340001,
                     help="O->T connection id (unique per concurrent originator)")
+    ap.add_argument("--to-multicast", action="store_true",
+                    help="request multicast T->O (for exclusive/input-only)")
+    ap.add_argument("--mcast-if", default="127.0.0.1",
+                    help="local interface IP used to join the multicast group")
     args = ap.parse_args()
 
     rpi_us = args.rpi_ms * 1000
@@ -204,10 +213,12 @@ def main():
 
     # connection-type specific parameters
     if args.conn_type == "exclusive":
-        ot_type, ot_size, to_type = CT_P2P, args.ot_size, CT_P2P
+        ot_type, ot_size = CT_P2P, args.ot_size
+        to_type = CT_MULTICAST if args.to_multicast else CT_P2P
     elif args.conn_type == "input-only":
-        ot_type, ot_size, to_type = CT_NULL, 0, CT_P2P       # heartbeat O->T
-    else:  # listen-only (joins shared multicast T->O)
+        ot_type, ot_size = CT_NULL, 0                        # heartbeat O->T
+        to_type = CT_MULTICAST if args.to_multicast else CT_P2P
+    else:  # listen-only (always joins shared multicast T->O)
         ot_type, ot_size, to_type = CT_NULL, 0, CT_MULTICAST
     heartbeat_only = (ot_size == 0)
 
@@ -219,17 +230,32 @@ def main():
     session = register_session(tcp)
     print("RegisterSession OK, handle=0x%08x" % session)
 
-    ot_id, to_id = forward_open(
+    ot_id, to_id, mcast_addr = forward_open(
         tcp, session, ot_cid, rpi_us, rpi_us, ot_size, args.to_size,
         serial, vid, osn, args.cfg_inst, args.out_inst, args.in_inst,
         ot_type=ot_type, to_type=to_type)
-    print("ForwardOpen OK [%s]: O->T id=0x%08x  T->O id=0x%08x"
-          % (args.conn_type, ot_id, to_id))
+    print("ForwardOpen OK [%s]: O->T id=0x%08x  T->O id=0x%08x%s"
+          % (args.conn_type, ot_id, to_id,
+             ("  T->O multicast=%s" % mcast_addr) if mcast_addr else ""))
 
-    # UDP I/O socket bound to our distinct local address
-    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp.bind((args.local, IO_PORT))
+    # O->T transmit socket (unicast to the adapter)
+    tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    tx.bind((args.local, IO_PORT))
+
+    # T->O receive socket
+    if mcast_addr:
+        # bind to the group address so only multicast (not unicast) is received,
+        # and join the group on the chosen local interface
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        udp.bind((mcast_addr, IO_PORT))
+        mreq = socket.inet_aton(mcast_addr) + socket.inet_aton(args.mcast_if)
+        udp.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    else:
+        udp = tx
     udp.setblocking(False)
 
     seq32 = seq16 = 0
@@ -252,7 +278,7 @@ def main():
                 out_counter = (out_counter + 1) & 0xFFFFFFFF
                 payload = struct.pack("<I", out_counter) + b"\xAA" * (args.ot_size - 4)
                 pkt = build_io_packet(ot_id, seq32, seq16, payload[:args.ot_size], run_idle)
-            udp.sendto(pkt, (args.adapter, IO_PORT))
+            tx.sendto(pkt, (args.adapter, IO_PORT))
             next_send += rpi_us / 1e6
 
         try:
@@ -285,7 +311,9 @@ def main():
     forward_close(tcp, session, serial, vid, osn,
                   args.cfg_inst, args.out_inst, args.in_inst)
     print("ForwardClose sent. Done.")
-    udp.close()
+    if udp is not tx:
+        udp.close()
+    tx.close()
     tcp.close()
     return 0 if rx_count > 0 else 1
 

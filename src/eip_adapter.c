@@ -139,6 +139,7 @@ typedef struct {
     uint32_t to_rpi_us;
     uint16_t ot_size;        /* consumed data size (bytes)                */
     uint16_t to_size;        /* produced data size (bytes)                */
+    int      to_multicast;   /* T->O served by the shared multicast stream */
     uint8_t  conn_tmo_mult;  /* connection timeout multiplier code        */
     uint32_t timeout_us;     /* inactivity timeout for O->T               */
 
@@ -157,6 +158,25 @@ static conn_t g_conns[MAX_CONNS];
 static uint8_t  g_out_image[512];   /* O->T consumed (owner outputs)        */
 static uint16_t g_out_len = 0;      /* valid bytes in g_out_image           */
 static uint32_t g_heartbeat = 0;    /* demo counter placed in produced data */
+
+/* Shared multicast T->O production. A single multicast stream is shared by the
+ * exclusive owner and any listen-only connections that join it. */
+static int       g_io_fd = -1;            /* UDP/2222 socket (for mcast opts) */
+static int       g_mcast_active = 0;
+static uint32_t  g_mcast_addr = 0;        /* group address (network order)    */
+static uint32_t  g_mcast_conn_id = 0;     /* shared T->O connection id        */
+static uint32_t  g_mcast_rpi_us = 0;
+static uint16_t  g_mcast_size = 0;
+static uint32_t  g_mcast_seq32 = 0;
+static uint16_t  g_mcast_seq16 = 0;
+static struct timespec g_mcast_next_send;
+static uint8_t   g_mcast_ttl = 1;
+
+/* For a Forward Open reply: network-order multicast addr to advertise as the
+ * T->O socket address item, or 0 when no item is needed. */
+static uint32_t  g_fo_sockaddr_to = 0;
+
+static uint32_t  g_my_ip_be = 0;   /* our IP (network order); 0 => unknown */
 
 static conn_t *conn_find_by_ot(uint32_t ot_id) {
     for (int i = 0; i < MAX_CONNS; i++)
@@ -186,6 +206,27 @@ static int conn_count_kind(conn_kind_t k) {
  * connections depend on (exclusive owner or input-only). */
 static int conn_count_producers(void) {
     return conn_count_kind(CONN_EXCLUSIVE) + conn_count_kind(CONN_INPUT_ONLY);
+}
+/* Producers (owner/input-only) that drive the shared multicast production. */
+static int conn_count_mcast_producers(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_CONNS; i++) {
+        conn_t *c = &g_conns[i];
+        if (c->active && c->to_multicast &&
+            (c->kind == CONN_EXCLUSIVE || c->kind == CONN_INPUT_ONLY)) n++;
+    }
+    return n;
+}
+
+/* CIP multicast address allocation (OpENer-style), assuming a /24 host part.
+ * The chosen group is reported to the originator in the Forward Open reply, so
+ * any valid value interoperates; this just follows the conventional formula. */
+static uint32_t cip_mcast_alloc(uint32_t ip_be) {
+    uint32_t ip = ntohl(ip_be);
+    uint32_t host_id = ip & 0xFF;          /* /24 host part */
+    if (host_id) host_id -= 1;
+    host_id &= 0x3FF;
+    return htonl(0xEFC00100u + (host_id << 5));   /* base 239.192.1.0 */
 }
 
 /* time helpers (monotonic) */
@@ -353,15 +394,22 @@ static uint32_t g_next_cid = 0x20000001;
 #define CM_EXT_INVALID_OT_SIZE   0x0127
 #define CM_EXT_INVALID_TO_SIZE   0x0128
 
-/* Drop listen-only connections once no producing connection remains. */
-static void drop_orphan_listeners(void) {
-    if (conn_count_producers() > 0) return;
-    for (int i = 0; i < MAX_CONNS; i++) {
-        if (g_conns[i].active && g_conns[i].kind == CONN_LISTEN_ONLY) {
-            logmsg("Listen-Only 0x%08x dropped: no producing connection left",
-                   g_conns[i].to_conn_id);
-            g_conns[i].active = 0;
+/* Drop listen-only connections once no producing connection remains, and stop
+ * the shared multicast production when its last producer is gone. */
+static void conns_cleanup(void) {
+    if (conn_count_producers() == 0) {
+        for (int i = 0; i < MAX_CONNS; i++) {
+            if (g_conns[i].active && g_conns[i].kind == CONN_LISTEN_ONLY) {
+                logmsg("Listen-Only 0x%08x dropped: no producing connection left",
+                       g_conns[i].to_conn_id);
+                g_conns[i].active = 0;
+            }
         }
+    }
+    if (g_mcast_active && conn_count_mcast_producers() == 0) {
+        struct in_addr a = { .s_addr = g_mcast_addr };
+        logmsg("Multicast T->O production stopped (%s)", inet_ntoa(a));
+        g_mcast_active = 0;
     }
 }
 
@@ -442,8 +490,8 @@ static int do_forward_open(int large, const uint8_t *d, int dl,
         logmsg("Forward Open rejected: ownership conflict (exclusive owner exists)");
         return fo_error(large, CM_EXT_OWNERSHIP, serial, vid, osn, resp);
     }
-    if (kind == CONN_LISTEN_ONLY && conn_count_producers() == 0) {
-        logmsg("Forward Open rejected: listen-only has no controlling connection");
+    if (kind == CONN_LISTEN_ONLY && !g_mcast_active) {
+        logmsg("Forward Open rejected: listen-only has no multicast production to join");
         return fo_error(large, CM_EXT_NO_OWNER, serial, vid, osn, resp);
     }
     if (g_rpi_min_us && (to_rpi < g_rpi_min_us ||
@@ -486,11 +534,45 @@ static int do_forward_open(int large, const uint8_t *d, int dl,
     c->timeout_us   = g_timeout_us ? g_timeout_us : ot_rpi * tmo_mult_value(tmo_mult);
     c->to_seq32     = 0;
     c->to_seq16     = 0;
+    c->to_multicast = 0;
+    g_fo_sockaddr_to = 0;
 
     memset(&c->peer, 0, sizeof(c->peer));
     c->peer.sin_family = AF_INET;
     c->peer.sin_port   = htons(EIP_IO_PORT);
     c->peer.sin_addr   = peer_ip;
+
+    /* ---- shared multicast T->O production ---- */
+    if (to_type == CT_MULTICAST) {
+        c->to_multicast = 1;
+        if (!g_mcast_active) {
+            /* established by the first producer (owner/input-only); a
+             * listen-only would have been rejected above. */
+            g_mcast_active  = 1;
+            g_mcast_addr    = cip_mcast_alloc(g_my_ip_be);
+            g_mcast_conn_id = g_next_cid++;
+            g_mcast_rpi_us  = to_rpi;
+            g_mcast_size    = c->to_size;
+            g_mcast_seq32   = 0;
+            g_mcast_seq16   = 0;
+            now_mono(&g_mcast_next_send);
+            if (g_io_fd >= 0) {
+                struct in_addr ifa = { .s_addr = g_my_ip_be ? g_my_ip_be
+                                                            : htonl(INADDR_LOOPBACK) };
+                uint8_t loop = 1;
+                setsockopt(g_io_fd, IPPROTO_IP, IP_MULTICAST_TTL,  &g_mcast_ttl, 1);
+                setsockopt(g_io_fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, 1);
+                setsockopt(g_io_fd, IPPROTO_IP, IP_MULTICAST_IF, &ifa, sizeof(ifa));
+            }
+            struct in_addr a = { .s_addr = g_mcast_addr };
+            logmsg("Multicast T->O production established: group %s id=0x%08x size=%u rpi=%uus",
+                   inet_ntoa(a), g_mcast_conn_id, g_mcast_size, g_mcast_rpi_us);
+        }
+        /* consumers share the production's connection id and size */
+        c->to_conn_id    = g_mcast_conn_id;
+        c->to_size       = g_mcast_size;
+        g_fo_sockaddr_to = g_mcast_addr;   /* advertise the group to originator */
+    }
 
     now_mono(&c->next_send);
     c->last_recv = c->next_send;
@@ -504,7 +586,17 @@ static int do_forward_open(int large, const uint8_t *d, int dl,
            ep.n_points > 1 ? ep.conn_points[1] : 0,
            ep.n_points > 2 ? ep.conn_points[2] : 0,
            tmo_mult_value(tmo_mult));
-    logmsg("Class 1 I/O endpoint: %s:%d", inet_ntoa(c->peer.sin_addr), EIP_IO_PORT);
+    if (c->to_multicast) {
+        char peer_s[16], grp_s[16];
+        struct in_addr a = { .s_addr = g_mcast_addr };
+        snprintf(peer_s, sizeof(peer_s), "%s", inet_ntoa(c->peer.sin_addr));
+        snprintf(grp_s,  sizeof(grp_s),  "%s", inet_ntoa(a));
+        logmsg("Class 1 I/O: O->T from %s:%d, T->O multicast to %s:%d",
+               peer_s, EIP_IO_PORT, grp_s, EIP_IO_PORT);
+    } else {
+        logmsg("Class 1 I/O endpoint: %s:%d (T->O unicast)",
+               inet_ntoa(c->peer.sin_addr), EIP_IO_PORT);
+    }
 
     /* Build success response */
     uint8_t *r = resp + 4;
@@ -537,7 +629,7 @@ static int do_forward_close(const uint8_t *d, int dl, uint8_t *resp) {
         logmsg("Forward Close [%s]: serial=0x%04x (O->T id=0x%08x)",
                kind_name(c->kind), serial, c->ot_conn_id);
         c->active = 0;
-        drop_orphan_listeners();
+        conns_cleanup();
     } else {
         logmsg("Forward Close: serial=0x%04x (unknown connection)", serial);
     }
@@ -599,17 +691,29 @@ static uint32_t g_next_session = 0x00010000;
 /* forward declaration: ListIdentity item builder (defined further below) */
 static int build_list_identity_item(uint8_t *out);
 
-/* Build a SendRRData response that wraps an MR response in a CPF. */
-static int build_send_rr_reply(const uint8_t *mr_resp, int mr_len, uint8_t *out) {
+/* Build a SendRRData response that wraps an MR response in a CPF.  When
+ * 'sockaddr_to' is non-zero (network order) a Socket Address Info T->O item
+ * (0x8001) advertising that multicast group is appended. */
+static int build_send_rr_reply(const uint8_t *mr_resp, int mr_len,
+                               uint32_t sockaddr_to, uint8_t *out) {
     uint8_t *p = out;
     put_u32(p, 0);  p += 4;   /* interface handle */
     put_u16(p, 0);  p += 2;   /* timeout */
-    put_u16(p, 2);  p += 2;   /* item count */
+    put_u16(p, sockaddr_to ? 3 : 2); p += 2;   /* item count */
     put_u16(p, CPF_NULL_ADDRESS); p += 2;   /* address item */
     put_u16(p, 0);                p += 2;
     put_u16(p, CPF_UNCONNECTED_DATA); p += 2;/* data item */
     put_u16(p, (uint16_t)mr_len);     p += 2;
     memcpy(p, mr_resp, mr_len);       p += mr_len;
+    if (sockaddr_to) {
+        /* Socket Address Info T->O: 16-byte sockaddr_in, BIG-endian fields */
+        put_u16(p, CPF_SOCKADDR_TO);  p += 2;
+        put_u16(p, 16);               p += 2;
+        put_u16be(p, AF_INET);        p += 2;
+        put_u16be(p, EIP_IO_PORT);    p += 2;
+        memcpy(p, &sockaddr_to, 4);   p += 4;   /* already network order */
+        memset(p, 0, 8);              p += 8;
+    }
     return (int)(p - out);
 }
 
@@ -674,8 +778,9 @@ static int process_encap(tcp_client_t *cl, const uint8_t *msg, int msg_len, uint
         if (mr) {
             hexdump("UCMM req", mr, mr_len);
             uint8_t mr_resp[BUF_SIZE];
+            g_fo_sockaddr_to = 0;
             int rl = handle_mr(mr, mr_len, cl->peer_ip, mr_resp);
-            body_len = build_send_rr_reply(mr_resp, rl, body);
+            body_len = build_send_rr_reply(mr_resp, rl, g_fo_sockaddr_to, body);
         } else {
             rh.status = ENCAP_STATUS_INVALID_LENGTH;
         }
@@ -698,8 +803,6 @@ static int process_encap(tcp_client_t *cl, const uint8_t *msg, int msg_len, uint
 /* -------------------------------------------------------------------------- */
 /* ListIdentity item (shared by TCP + UDP discovery)                          */
 /* -------------------------------------------------------------------------- */
-
-static uint32_t g_my_ip_be = 0; /* network byte order; 0 => unknown */
 
 static int build_list_identity_item(uint8_t *out) {
     uint8_t *p = out;
@@ -732,34 +835,47 @@ static int build_list_identity_item(uint8_t *out) {
 /* Class 1 implicit I/O (UDP/2222)                                            */
 /* -------------------------------------------------------------------------- */
 
-/* Build and send one T->O produced data packet for a connection.
- * Every T->O consumer (exclusive-owner, input-only, listen-only) receives the
- * same shared input image. */
-static void io_produce(int io_fd, conn_t *c) {
-    uint8_t pkt[BUF_SIZE];
+/* Build one T->O CPF packet (sequenced address + connected data with the
+ * shared input image). Returns the packet length. */
+static int build_to_packet(uint8_t *pkt, uint32_t conn_id,
+                           uint32_t seq32, uint16_t seq16, uint16_t size) {
     uint8_t image[512];
+    build_input_image(image, size);
+
     uint8_t *p = pkt;
-
-    g_heartbeat++;
-    build_input_image(image, c->to_size);
-
     put_u16(p, 2); p += 2;                       /* CPF item count */
-    /* Sequenced Address Item */
-    put_u16(p, CPF_SEQUENCED_ADDRESS); p += 2;
+    put_u16(p, CPF_SEQUENCED_ADDRESS); p += 2;   /* sequenced address item */
     put_u16(p, 8); p += 2;
-    put_u32(p, c->to_conn_id); p += 4;
-    put_u32(p, ++c->to_seq32);  p += 4;
-    /* Connected Data Item */
-    put_u16(p, CPF_CONNECTED_DATA); p += 2;
+    put_u32(p, conn_id); p += 4;
+    put_u32(p, seq32);   p += 4;
+    put_u16(p, CPF_CONNECTED_DATA); p += 2;      /* connected data item */
     uint8_t *dlen = p; p += 2;
     uint8_t *dstart = p;
-    put_u16(p, ++c->to_seq16); p += 2;           /* class-1 sequence count */
+    put_u16(p, seq16); p += 2;                   /* class-1 sequence count */
     if (g_to_run_idle) { put_u32(p, 1); p += 4; }/* run/idle: run */
-    memcpy(p, image, c->to_size); p += c->to_size;
+    memcpy(p, image, size); p += size;
     put_u16(dlen, (uint16_t)(p - dstart));
+    return (int)(p - pkt);
+}
 
-    sendto(io_fd, pkt, (size_t)(p - pkt), 0,
-           (struct sockaddr *)&c->peer, sizeof(c->peer));
+/* Produce one unicast (point-to-point) T->O packet to a connection's peer. */
+static void io_produce(int io_fd, conn_t *c) {
+    uint8_t pkt[BUF_SIZE];
+    g_heartbeat++;
+    int n = build_to_packet(pkt, c->to_conn_id, ++c->to_seq32, ++c->to_seq16, c->to_size);
+    sendto(io_fd, pkt, (size_t)n, 0, (struct sockaddr *)&c->peer, sizeof(c->peer));
+}
+
+/* Produce one multicast T->O packet shared by all multicast consumers. */
+static void io_produce_mcast(int io_fd) {
+    uint8_t pkt[BUF_SIZE];
+    struct sockaddr_in dst = {0};
+    dst.sin_family = AF_INET;
+    dst.sin_port   = htons(EIP_IO_PORT);
+    dst.sin_addr.s_addr = g_mcast_addr;
+    g_heartbeat++;
+    int n = build_to_packet(pkt, g_mcast_conn_id, ++g_mcast_seq32, ++g_mcast_seq16, g_mcast_size);
+    sendto(io_fd, pkt, (size_t)n, 0, (struct sockaddr *)&dst, sizeof(dst));
 }
 
 /* Handle one received O->T implicit packet. */
@@ -1203,6 +1319,7 @@ int main(int argc, char **argv) {
                 strerror(errno), EIP_TCP_PORT, EIP_IO_PORT);
         return 1;
     }
+    g_io_fd = io_fd;   /* used to configure multicast egress on demand */
 
     logmsg("EtherNet/IP adapter '%s' ready (vendor=0x%04x dev_type=%u "
            "prod=0x%04x rev=%u.%u serial=0x%08x)",
@@ -1245,8 +1362,13 @@ int main(int argc, char **argv) {
         int timeout_ms = 1000;
         struct timespec now; now_mono(&now);
         for (int i = 0; i < MAX_CONNS; i++) {
-            if (!g_conns[i].active) continue;
+            if (!g_conns[i].active || g_conns[i].to_multicast) continue;
             long us = ts_diff_us(&g_conns[i].next_send, &now);
+            int ms = us <= 0 ? 0 : (int)(us / 1000);
+            if (ms < timeout_ms) timeout_ms = ms;
+        }
+        if (g_mcast_active) {
+            long us = ts_diff_us(&g_mcast_next_send, &now);
             int ms = us <= 0 ? 0 : (int)(us / 1000);
             if (ms < timeout_ms) timeout_ms = ms;
         }
@@ -1350,9 +1472,11 @@ int main(int argc, char **argv) {
                 logmsg("Connection 0x%08x [%s] timed out (no O->T for %u us)",
                        cc->ot_conn_id, kind_name(cc->kind), cc->timeout_us);
                 cc->active = 0;
-                drop_orphan_listeners();
+                conns_cleanup();
                 continue;
             }
+            /* multicast consumers are served by the shared stream below */
+            if (cc->to_multicast) continue;
             if (ts_diff_us(&now, &cc->next_send) >= 0) {
                 io_produce(io_fd, cc);
                 ts_add_us(&cc->next_send, cc->to_rpi_us ? cc->to_rpi_us : 10000);
@@ -1361,6 +1485,17 @@ int main(int argc, char **argv) {
                     cc->next_send = now;
                     ts_add_us(&cc->next_send, cc->to_rpi_us ? cc->to_rpi_us : 10000);
                 }
+            }
+        }
+
+        /* --- shared multicast T->O production --- */
+        if (g_mcast_active && ts_diff_us(&now, &g_mcast_next_send) >= 0) {
+            io_produce_mcast(io_fd);
+            uint32_t rpi = g_mcast_rpi_us ? g_mcast_rpi_us : 10000;
+            ts_add_us(&g_mcast_next_send, rpi);
+            if (ts_diff_us(&now, &g_mcast_next_send) > 0) {
+                g_mcast_next_send = now;
+                ts_add_us(&g_mcast_next_send, rpi);
             }
         }
     }

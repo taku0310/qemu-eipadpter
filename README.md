@@ -262,7 +262,7 @@ Class 1 のアプリケーション接続には 3 種類があり、Forward Open
 
 セマンティクス:
 - **Exclusive-Owner** は 1 つだけ。2 つ目は `0x0106`（所有権競合）で拒否
-- **Listen-Only** は producer（Exclusive-Owner か Input-Only）が無いと `0x0119` で拒否。
+- **Listen-Only** は共有マルチキャスト生産が無いと `0x0119` で拒否。
   全 producer が閉じると Listen-Only も自動切断
 - 出力イメージは Exclusive-Owner の O→T のみが更新し、入力イメージは全 T→O 消費者へ
   共通に生産されます（複数消費者モデル）
@@ -275,17 +275,35 @@ Class 1 のアプリケーション接続には 3 種類があり、Forward Open
 
 設定ファイルでは `allow_exclusive` / `allow_input_only` / `allow_listen_only`。
 
+### マルチキャスト T→O / Multicast production
+
+T→O 接続種別（connection type）が **Multicast** の場合、アダプタは 1 本の
+マルチキャストストリームを生産し、Exclusive-Owner と複数の Listen-Only が
+これを共有します。
+
+- アダプタが CIP のアルゴリズムでグループアドレス（既定 `239.192.x.x`）を割当て、
+  Forward Open 応答の **T→O ソケットアドレス項目（CPF 0x8001）** でオリジネータに通知
+- 共有する全消費者は同一の T→O 接続 ID・同一グループを受信（単一ストリーム）
+- 最初の producer（Exclusive-Owner）が生産を確立し、Listen-Only はこれに join
+- 全 producer が閉じると生産停止、Listen-Only も切断
+- Listen-Only は **マルチキャスト生産が存在する**ことが前提（producer が P2P の場合は
+  傍受できず `0x0119`）
+
 テストツールでの各種別の指定:
 
 ```sh
-python3 tools/eip_originator.py --conn-type exclusive   --local 127.0.0.2
-python3 tools/eip_originator.py --conn-type input-only   --local 127.0.0.2 --serial 0x02 --ot-cid 0x12340002
-# Listen-Only は producer が居る状態で（別オリジネータを並行起動、別ローカルIP）
-python3 tools/eip_originator.py --conn-type listen-only   --local 127.0.0.3 --serial 0x03 --ot-cid 0x12340003
+# ユニキャスト
+python3 tools/eip_originator.py --conn-type exclusive  --local 127.0.0.2
+python3 tools/eip_originator.py --conn-type input-only  --local 127.0.0.2 --serial 0x02 --ot-cid 0x12340002
+
+# マルチキャスト共有: owner を --to-multicast で起動し、Listen-Only を別IPで並行起動
+python3 tools/eip_originator.py --conn-type exclusive   --to-multicast --local 127.0.0.2 --serial 0x01 --ot-cid 0x12340001 &
+python3 tools/eip_originator.py --conn-type listen-only  --local 127.0.0.3 --serial 0x03 --ot-cid 0x12340003
 ```
 
-> 注: 本実装は T→O を各消費者へユニキャスト送信します（真のマルチキャスト生産は
-> 未対応ですが、Listen-Only の動作確認には十分です）。
+> 注: マルチキャスト送信 TTL は既定 1（ローカルセグメント）です。ローカル単一ホストで
+> 試す場合、テストツールは `--mcast-if`（既定 127.0.0.1）でループバック上の
+> グループに join します。
 
 ---
 
@@ -362,7 +380,9 @@ Makefile
 ## 制限 / Notes & limitations
 
 - Exclusive-Owner / Input-Only / Listen-Only に対応し、最大 8 接続まで同時保持します。
-- T→O は各消費者へ point-to-point ユニキャスト送信です（真のマルチキャスト生産は未対応）。
+- T→O は point-to-point ユニキャストと **multicast 生産**の両方に対応します
+  （マルチキャストは 1 ストリームを複数消費者で共有）。マルチキャスト生産は1グループ
+  （単一入力アセンブリ）を想定しています。
 - デバイスは単一の入出力イメージを持ち、出力は Exclusive-Owner のみが更新、入力は
   全 T→O 消費者へ共通に生産します。接続パスのアセンブリ番号は解析・ログ出力します。
 - 教育 / 検証用途を想定した軽量実装であり、ODVA 認証取得品ではありません。
