@@ -19,6 +19,7 @@
 #   INITRD    path to the initramfs                 [default: build/initramfs.cpio.gz]
 #   MODE      tap | user                            [default: user]
 #   TAP       tap device name (MODE=tap)            [default: tap0]
+#   MAC       guest NIC MAC (give each VM a unique one on a shared bridge)
 #   MEM       guest RAM                             [default: 256M]
 #   QEMU      qemu binary                           [default: qemu-system-x86_64]
 set -eu
@@ -28,6 +29,7 @@ KERNEL="${KERNEL:-/boot/vmlinuz-$(uname -r)}"
 INITRD="${INITRD:-$ROOT/build/initramfs.cpio.gz}"
 MODE="${MODE:-user}"
 TAP="${TAP:-tap0}"
+MAC="${MAC:-52:54:00:12:34:56}"
 MEM="${MEM:-256M}"
 QEMU="${QEMU:-qemu-system-x86_64}"
 
@@ -39,12 +41,12 @@ APPEND="console=ttyS0 quiet"
 
 case "$MODE" in
   tap)
-    NET="-netdev tap,id=n0,ifname=$TAP,script=no,downscript=no -device e1000,netdev=n0"
-    echo ">> MODE=tap via $TAP (ensure it is up and bridged to your network)"
+    NET="-netdev tap,id=n0,ifname=$TAP,script=no,downscript=no -device e1000,netdev=n0,mac=$MAC"
+    echo ">> MODE=tap via $TAP mac=$MAC (attach $TAP to your bridge, e.g. br0)"
     ;;
   user)
     # Forward host:44818 -> guest:44818 (TCP) and host:2222 -> guest:2222 (UDP).
-    NET="-netdev user,id=n0,hostfwd=tcp::44818-:44818,hostfwd=udp::2222-:2222 -device e1000,netdev=n0"
+    NET="-netdev user,id=n0,hostfwd=tcp::44818-:44818,hostfwd=udp::2222-:2222 -device e1000,netdev=n0,mac=$MAC"
     echo ">> MODE=user with host port forwards tcp/44818 and udp/2222"
     echo "   (broadcast ListIdentity discovery will NOT traverse user-mode NAT)"
     ;;
