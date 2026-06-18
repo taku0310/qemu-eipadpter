@@ -1,0 +1,7 @@
+# build artifacts
+/eip_adapter
+/build/
+*.o
+*.cpio.gz
+__pycache__/
+*.pyc
