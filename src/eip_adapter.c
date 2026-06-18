@@ -81,6 +81,11 @@ static char     g_product_name[64] = DEV_PRODUCT_NAME;
 static char     g_vendor_name[64]  = "QEMU";
 static uint32_t g_rpi_default_us   = 10000;  /* RPI advertised in EDS */
 
+/* ---- which application connection kinds the adapter accepts ---- */
+static int g_allow_exclusive   = 1;
+static int g_allow_input_only  = 1;
+static int g_allow_listen_only = 1;
+
 static void logmsg(const char *fmt, ...) {
     if (!g_verbose) return;
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
@@ -106,8 +111,25 @@ static void hexdump(const char *tag, const uint8_t *d, int n) {
 /* Class 1 connection state                                                   */
 /* -------------------------------------------------------------------------- */
 
+/* Application connection kinds (CIP Connection Manager) */
+typedef enum {
+    CONN_EXCLUSIVE,    /* owns O->T outputs and produces T->O inputs        */
+    CONN_INPUT_ONLY,   /* heartbeat O->T, produces T->O; does not own       */
+    CONN_LISTEN_ONLY   /* heartbeat O->T, listens to shared T->O production */
+} conn_kind_t;
+
+static const char *kind_name(conn_kind_t k) {
+    switch (k) {
+    case CONN_EXCLUSIVE:   return "Exclusive-Owner";
+    case CONN_INPUT_ONLY:  return "Input-Only";
+    case CONN_LISTEN_ONLY: return "Listen-Only";
+    }
+    return "?";
+}
+
 typedef struct {
     int      active;
+    conn_kind_t kind;
     uint32_t ot_conn_id;     /* O->T connection id (we consume on this)   */
     uint32_t to_conn_id;     /* T->O connection id (we produce, assigned) */
     uint16_t conn_serial;
@@ -122,17 +144,19 @@ typedef struct {
 
     uint32_t to_seq32;       /* sequenced-address sequence number         */
     uint16_t to_seq16;       /* CIP transport-class-1 sequence count      */
-    uint32_t prod_counter;   /* demo heartbeat placed in produced data    */
 
     struct sockaddr_in peer; /* originator UDP I/O endpoint               */
     struct timespec next_send;
     struct timespec last_recv;
-
-    uint8_t  ot_data[512];   /* last consumed output image                */
-    uint8_t  to_data[512];   /* produced input image                      */
 } conn_t;
 
 static conn_t g_conns[MAX_CONNS];
+
+/* Shared device I/O images: one output (written by the exclusive owner) and
+ * one input (produced to every T->O consumer). */
+static uint8_t  g_out_image[512];   /* O->T consumed (owner outputs)        */
+static uint16_t g_out_len = 0;      /* valid bytes in g_out_image           */
+static uint32_t g_heartbeat = 0;    /* demo counter placed in produced data */
 
 static conn_t *conn_find_by_ot(uint32_t ot_id) {
     for (int i = 0; i < MAX_CONNS; i++)
@@ -151,6 +175,17 @@ static conn_t *conn_alloc(void) {
     for (int i = 0; i < MAX_CONNS; i++)
         if (!g_conns[i].active) { memset(&g_conns[i], 0, sizeof(conn_t)); return &g_conns[i]; }
     return NULL;
+}
+static int conn_count_kind(conn_kind_t k) {
+    int n = 0;
+    for (int i = 0; i < MAX_CONNS; i++)
+        if (g_conns[i].active && g_conns[i].kind == k) n++;
+    return n;
+}
+/* A "producing" connection drives the shared T->O stream that listen-only
+ * connections depend on (exclusive owner or input-only). */
+static int conn_count_producers(void) {
+    return conn_count_kind(CONN_EXCLUSIVE) + conn_count_kind(CONN_INPUT_ONLY);
 }
 
 /* time helpers (monotonic) */
@@ -180,6 +215,19 @@ static int put_short_string(uint8_t *out, const char *s) {
     out[0] = (uint8_t)n;
     memcpy(out + 1, s, n);
     return n + 1;
+}
+
+/* Render the current produced (T->O / input) image into 'buf'.
+ * First 4 bytes carry the demo heartbeat counter; the remainder mirrors the
+ * exclusive owner's consumed outputs when loopback is enabled. */
+static void build_input_image(uint8_t *buf, uint16_t size) {
+    memset(buf, 0, size);
+    if (size >= 4) put_u32(buf, g_heartbeat);
+    if (g_loopback && size > 4 && g_out_len) {
+        int n = g_out_len;
+        if (n > size - 4) n = size - 4;
+        memcpy(buf + 4, g_out_image, n);
+    }
 }
 
 /*
@@ -223,11 +271,11 @@ static int handle_explicit(uint8_t service, uint16_t class_id, uint32_t inst,
     } else if (class_id == CLASS_ASSEMBLY) {
         /* Get the current assembly image (input/output) */
         if (service == CIP_GET_ATTR_SINGLE && attr == 3) {
-            conn_t *c = NULL;
-            for (int i = 0; i < MAX_CONNS; i++) if (g_conns[i].active) { c = &g_conns[i]; break; }
-            if (c) {
-                if (inst == g_in_inst)  { memcpy(p, c->to_data, c->to_size); p += c->to_size; }
-                else                    { memcpy(p, c->ot_data, c->ot_size); p += c->ot_size; }
+            if (inst == g_in_inst) {
+                uint16_t sz = g_exp_in_size ? g_exp_in_size : ASM_INPUT_SIZE;
+                build_input_image(p, sz); p += sz;
+            } else {
+                memcpy(p, g_out_image, g_out_len); p += g_out_len;
             }
             n = (int)(p - resp);
         } else {
@@ -282,6 +330,14 @@ static uint16_t conn_param_size(uint32_t params, int large) {
     return (uint16_t)(large ? (params & 0xFFFF) : (params & 0x01FF));
 }
 
+/* connection type from network connection parameters: 0=Null 1=Multicast 2=P2P */
+#define CT_NULL      0
+#define CT_MULTICAST 1
+#define CT_P2P       2
+static int conn_param_type(uint32_t params, int large) {
+    return large ? (int)((params >> 29) & 0x3) : (int)((params >> 13) & 0x3);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Forward Open / Forward Close                                               */
 /* -------------------------------------------------------------------------- */
@@ -289,10 +345,25 @@ static uint16_t conn_param_size(uint32_t params, int large) {
 static uint32_t g_next_cid = 0x20000001;
 
 /* Connection Manager extended status codes for an unsuccessful Forward Open */
+#define CM_EXT_CONN_TYPE_UNSUP   0x0103  /* transport/connection type not supported */
+#define CM_EXT_OWNERSHIP         0x0106  /* ownership conflict (2nd exclusive owner) */
 #define CM_EXT_RPI_NOT_SUPPORTED 0x0111
 #define CM_EXT_CONN_LIMIT        0x0113
+#define CM_EXT_NO_OWNER          0x0119  /* listen-only with no controlling connection */
 #define CM_EXT_INVALID_OT_SIZE   0x0127
 #define CM_EXT_INVALID_TO_SIZE   0x0128
+
+/* Drop listen-only connections once no producing connection remains. */
+static void drop_orphan_listeners(void) {
+    if (conn_count_producers() > 0) return;
+    for (int i = 0; i < MAX_CONNS; i++) {
+        if (g_conns[i].active && g_conns[i].kind == CONN_LISTEN_ONLY) {
+            logmsg("Listen-Only 0x%08x dropped: no producing connection left",
+                   g_conns[i].to_conn_id);
+            g_conns[i].active = 0;
+        }
+    }
+}
 
 /* Build an unsuccessful Forward Open response carrying an extended status. */
 static int fo_error(int large, uint16_t ext, uint16_t serial,
@@ -343,17 +414,49 @@ static int do_forward_open(int large, const uint8_t *d, int dl,
 
     uint16_t ot_size = conn_param_size(ot_par, large);
     uint16_t to_size = conn_param_size(to_par, large);
+    int ot_type = conn_param_type(ot_par, large);
+    int to_type = conn_param_type(to_par, large);
 
-    /* ---- validate request against the adapter's configured policy ---- */
-    if (g_rpi_min_us && (ot_rpi < g_rpi_min_us || to_rpi < g_rpi_min_us)) {
+    /* ---- classify the application connection kind ----
+     * A heartbeat O->T (Null connection type or zero size) means the originator
+     * does not own outputs: it is Input-Only, or Listen-Only when it joins the
+     * shared (multicast) T->O production. */
+    conn_kind_t kind;
+    if (ot_type == CT_NULL || ot_size == 0)
+        kind = (to_type == CT_MULTICAST) ? CONN_LISTEN_ONLY : CONN_INPUT_ONLY;
+    else
+        kind = CONN_EXCLUSIVE;
+
+    /* re-open of the same originator triple is allowed */
+    conn_t *existing = conn_find_by_serial(serial, vid, osn);
+
+    /* ---- validate against configured policy ---- */
+    int allowed = (kind == CONN_EXCLUSIVE   && g_allow_exclusive) ||
+                  (kind == CONN_INPUT_ONLY  && g_allow_input_only) ||
+                  (kind == CONN_LISTEN_ONLY && g_allow_listen_only);
+    if (!allowed) {
+        logmsg("Forward Open rejected: %s connections not allowed", kind_name(kind));
+        return fo_error(large, CM_EXT_CONN_TYPE_UNSUP, serial, vid, osn, resp);
+    }
+    if (kind == CONN_EXCLUSIVE && !existing && conn_count_kind(CONN_EXCLUSIVE) > 0) {
+        logmsg("Forward Open rejected: ownership conflict (exclusive owner exists)");
+        return fo_error(large, CM_EXT_OWNERSHIP, serial, vid, osn, resp);
+    }
+    if (kind == CONN_LISTEN_ONLY && conn_count_producers() == 0) {
+        logmsg("Forward Open rejected: listen-only has no controlling connection");
+        return fo_error(large, CM_EXT_NO_OWNER, serial, vid, osn, resp);
+    }
+    if (g_rpi_min_us && (to_rpi < g_rpi_min_us ||
+                         (kind == CONN_EXCLUSIVE && ot_rpi < g_rpi_min_us))) {
         logmsg("Forward Open rejected: RPI below minimum (%u us)", g_rpi_min_us);
         return fo_error(large, CM_EXT_RPI_NOT_SUPPORTED, serial, vid, osn, resp);
     }
-    if (g_rpi_max_us && (ot_rpi > g_rpi_max_us || to_rpi > g_rpi_max_us)) {
+    if (g_rpi_max_us && (to_rpi > g_rpi_max_us ||
+                         (kind == CONN_EXCLUSIVE && ot_rpi > g_rpi_max_us))) {
         logmsg("Forward Open rejected: RPI above maximum (%u us)", g_rpi_max_us);
         return fo_error(large, CM_EXT_RPI_NOT_SUPPORTED, serial, vid, osn, resp);
     }
-    if (g_exp_out_size && ot_size != g_exp_out_size) {
+    if (kind == CONN_EXCLUSIVE && g_exp_out_size && ot_size != g_exp_out_size) {
         logmsg("Forward Open rejected: O->T size %u != expected %u", ot_size, g_exp_out_size);
         return fo_error(large, CM_EXT_INVALID_OT_SIZE, serial, vid, osn, resp);
     }
@@ -362,15 +465,14 @@ static int do_forward_open(int large, const uint8_t *d, int dl,
         return fo_error(large, CM_EXT_INVALID_TO_SIZE, serial, vid, osn, resp);
     }
 
-    /* If a connection with this triple already exists, treat as re-open */
-    conn_t *c = conn_find_by_serial(serial, vid, osn);
-    if (!c) c = conn_alloc();
+    conn_t *c = existing ? existing : conn_alloc();
     if (!c) {
         logmsg("Forward Open rejected: connection limit reached");
         return fo_error(large, CM_EXT_CONN_LIMIT, serial, vid, osn, resp);
     }
 
     c->active       = 1;
+    c->kind         = kind;
     c->ot_conn_id   = ot_cid;
     c->to_conn_id   = (to_cid != 0) ? to_cid : g_next_cid++;
     c->conn_serial  = serial;
@@ -378,13 +480,12 @@ static int do_forward_open(int large, const uint8_t *d, int dl,
     c->orig_serial  = osn;
     c->ot_rpi_us    = ot_rpi;
     c->to_rpi_us    = to_rpi;
-    c->ot_size      = ot_size > sizeof(c->ot_data) ? sizeof(c->ot_data) : ot_size;
-    c->to_size      = to_size > sizeof(c->to_data) ? sizeof(c->to_data) : to_size;
+    c->ot_size      = ot_size > sizeof(g_out_image) ? (uint16_t)sizeof(g_out_image) : ot_size;
+    c->to_size      = to_size > 512 ? 512 : to_size;
     c->conn_tmo_mult= tmo_mult;
     c->timeout_us   = g_timeout_us ? g_timeout_us : ot_rpi * tmo_mult_value(tmo_mult);
     c->to_seq32     = 0;
     c->to_seq16     = 0;
-    c->prod_counter = 0;
 
     memset(&c->peer, 0, sizeof(c->peer));
     c->peer.sin_family = AF_INET;
@@ -394,9 +495,10 @@ static int do_forward_open(int large, const uint8_t *d, int dl,
     now_mono(&c->next_send);
     c->last_recv = c->next_send;
 
-    logmsg("Forward%s Open: serial=0x%04x vid=0x%04x O->T id=0x%08x(%uB rpi=%uus) "
+    logmsg("Forward%s Open [%s]: serial=0x%04x vid=0x%04x O->T id=0x%08x(%uB rpi=%uus) "
            "T->O id=0x%08x(%uB rpi=%uus) cfg=%u out=%u in=%u tmo*=%u",
-           large ? " (Large)" : "", serial, vid, c->ot_conn_id, c->ot_size, ot_rpi,
+           large ? " (Large)" : "", kind_name(c->kind), serial, vid,
+           c->ot_conn_id, c->ot_size, ot_rpi,
            c->to_conn_id, c->to_size, to_rpi,
            ep.n_points > 0 ? ep.conn_points[0] : 0,
            ep.n_points > 1 ? ep.conn_points[1] : 0,
@@ -432,8 +534,10 @@ static int do_forward_close(const uint8_t *d, int dl, uint8_t *resp) {
 
     conn_t *c = conn_find_by_serial(serial, vid, osn);
     if (c) {
-        logmsg("Forward Close: serial=0x%04x (O->T id=0x%08x)", serial, c->ot_conn_id);
+        logmsg("Forward Close [%s]: serial=0x%04x (O->T id=0x%08x)",
+               kind_name(c->kind), serial, c->ot_conn_id);
         c->active = 0;
+        drop_orphan_listeners();
     } else {
         logmsg("Forward Close: serial=0x%04x (unknown connection)", serial);
     }
@@ -628,19 +732,16 @@ static int build_list_identity_item(uint8_t *out) {
 /* Class 1 implicit I/O (UDP/2222)                                            */
 /* -------------------------------------------------------------------------- */
 
-/* Build and send one T->O produced data packet. */
+/* Build and send one T->O produced data packet for a connection.
+ * Every T->O consumer (exclusive-owner, input-only, listen-only) receives the
+ * same shared input image. */
 static void io_produce(int io_fd, conn_t *c) {
     uint8_t pkt[BUF_SIZE];
+    uint8_t image[512];
     uint8_t *p = pkt;
 
-    /* refresh produced image: heartbeat counter + optional loopback */
-    c->prod_counter++;
-    if (c->to_size >= 4) put_u32(c->to_data, c->prod_counter);
-    if (g_loopback && c->ot_size && c->to_size > 4) {
-        int n = c->ot_size;
-        if (n > c->to_size - 4) n = c->to_size - 4;
-        memcpy(c->to_data + 4, c->ot_data, n);
-    }
+    g_heartbeat++;
+    build_input_image(image, c->to_size);
 
     put_u16(p, 2); p += 2;                       /* CPF item count */
     /* Sequenced Address Item */
@@ -654,7 +755,7 @@ static void io_produce(int io_fd, conn_t *c) {
     uint8_t *dstart = p;
     put_u16(p, ++c->to_seq16); p += 2;           /* class-1 sequence count */
     if (g_to_run_idle) { put_u32(p, 1); p += 4; }/* run/idle: run */
-    memcpy(p, c->to_data, c->to_size); p += c->to_size;
+    memcpy(p, image, c->to_size); p += c->to_size;
     put_u16(dlen, (uint16_t)(p - dstart));
 
     sendto(io_fd, pkt, (size_t)(p - pkt), 0,
@@ -686,15 +787,21 @@ static void io_consume(const uint8_t *pkt, int len) {
     conn_t *c = conn_find_by_ot(conn_id);
     if (!c) return; /* unknown / stale connection */
 
-    now_mono(&c->last_recv);
+    now_mono(&c->last_recv);    /* any O->T packet is also a keep-alive */
+
+    /* Only the exclusive owner contributes real output data; input-only and
+     * listen-only O->T packets are heartbeats and carry no application data. */
+    if (c->kind != CONN_EXCLUSIVE) return;
 
     /* connected data = 16-bit seq count [+ 32-bit run/idle] + payload */
     const uint8_t *d = data; int dl = data_len;
     if (dl >= 2) { d += 2; dl -= 2; }            /* class-1 sequence count */
     if (g_ot_run_idle && dl >= 4) { d += 4; dl -= 4; } /* run/idle header  */
 
-    int n = dl; if (n > (int)sizeof(c->ot_data)) n = sizeof(c->ot_data);
-    memcpy(c->ot_data, d, n);
+    int n = dl; if (n > (int)sizeof(g_out_image)) n = sizeof(g_out_image);
+    if (n < 0) n = 0;
+    memcpy(g_out_image, d, n);
+    g_out_len = (uint16_t)n;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -763,6 +870,9 @@ static int set_param(const char *k, const char *v) {
     else if (!strcmp(k, "ot_run_idle"))  g_ot_run_idle = atoi(v);
     else if (!strcmp(k, "to_run_idle"))  g_to_run_idle = atoi(v);
     else if (!strcmp(k, "loopback"))     g_loopback = atoi(v);
+    else if (!strcmp(k, "allow_exclusive"))   g_allow_exclusive = atoi(v);
+    else if (!strcmp(k, "allow_input_only"))  g_allow_input_only = atoi(v);
+    else if (!strcmp(k, "allow_listen_only")) g_allow_listen_only = atoi(v);
     else if (!strcmp(k, "vendor_id"))    g_vendor_id = (uint16_t)strtol(v, NULL, 0);
     else if (!strcmp(k, "device_type"))  g_device_type = (uint16_t)strtol(v, NULL, 0);
     else if (!strcmp(k, "product_code")) g_product_code = (uint16_t)strtol(v, NULL, 0);
@@ -885,20 +995,47 @@ static int write_eds(const char *path) {
         "                0x0000,,,;\n\n",
         g_out_inst, out_size * 8, g_in_inst, in_size * 8, g_cfg_inst);
 
-    /* Connection Manager: one exclusive-owner Class 1 connection */
-    fprintf(f,
-        "[Connection Manager]\n"
-        "        Connection1 =\n"
-        "                0x84010002,           $ trigger & transport: Class 1, cyclic, O2T+T2O\n"
-        "                0x44640405,           $ params: O2T P2P, T2O P2P, scheduled\n"
-        "                ,Param1,%u,,          $ O2T RPI(param), size(bytes), format\n"
-        "                ,Param2,%u,,          $ T2O RPI(param), size(bytes), format\n"
-        "                ,,                    $ config #1\n"
-        "                ,                     $ config #2\n"
-        "                \"Exclusive Owner\",   $ connection name\n"
-        "                \"\",                  $ help string\n"
-        "                \"20 04 24 %02X 2C %02X 2C %02X\"; $ path: Assembly cfg/O2T/T2O\n\n",
-        out_size, in_size, g_cfg_inst & 0xFF, g_out_inst & 0xFF, g_in_inst & 0xFF);
+    /* Connection Manager: one entry per supported application connection kind.
+     * Template trigger/transport and param bitmasks (validate in EZ-EDS). */
+    fprintf(f, "[Connection Manager]\n");
+    int cn = 0;
+    if (g_allow_exclusive) {
+        fprintf(f,
+            "        Connection%d =\n"
+            "                0x84010002,           $ Class 1, cyclic, exclusive owner\n"
+            "                0x44640405,           $ params: O2T P2P, T2O P2P\n"
+            "                ,Param1,%u,,          $ O2T RPI(param), size(bytes), format\n"
+            "                ,Param2,%u,,          $ T2O RPI(param), size(bytes), format\n"
+            "                ,,,\n"
+            "                \"Exclusive Owner\",\"\",\n"
+            "                \"20 04 24 %02X 2C %02X 2C %02X\";\n",
+            ++cn, out_size, in_size, g_cfg_inst & 0xFF, g_out_inst & 0xFF, g_in_inst & 0xFF);
+    }
+    if (g_allow_input_only) {
+        fprintf(f,
+            "        Connection%d =\n"
+            "                0x82010002,           $ Class 1, cyclic, input only\n"
+            "                0x44240405,           $ params: O2T heartbeat, T2O P2P\n"
+            "                ,Param1,0,,           $ O2T heartbeat (size 0)\n"
+            "                ,Param2,%u,,          $ T2O RPI(param), size(bytes)\n"
+            "                ,,,\n"
+            "                \"Input Only\",\"\",\n"
+            "                \"20 04 24 %02X 2C %02X 2C %02X\";\n",
+            ++cn, in_size, g_cfg_inst & 0xFF, g_out_inst & 0xFF, g_in_inst & 0xFF);
+    }
+    if (g_allow_listen_only) {
+        fprintf(f,
+            "        Connection%d =\n"
+            "                0x81010002,           $ Class 1, cyclic, listen only\n"
+            "                0x46240405,           $ params: O2T heartbeat, T2O multicast\n"
+            "                ,Param1,0,,           $ O2T heartbeat (size 0)\n"
+            "                ,Param2,%u,,          $ T2O RPI(param), size(bytes)\n"
+            "                ,,,\n"
+            "                \"Listen Only\",\"\",\n"
+            "                \"20 04 24 %02X 2C %02X 2C %02X\";\n",
+            ++cn, in_size, g_cfg_inst & 0xFF, g_out_inst & 0xFF, g_in_inst & 0xFF);
+    }
+    fprintf(f, "\n");
 
     fclose(f);
     return 0;
@@ -913,7 +1050,8 @@ enum {
     OPT_CFG_INST = 1000, OPT_OUT_SIZE, OPT_IN_SIZE,
     OPT_RPI_MIN, OPT_RPI_MAX, OPT_TIMEOUT,
     OPT_VENDOR, OPT_DEVTYPE, OPT_PRODCODE, OPT_SERIAL, OPT_NAME, OPT_REV,
-    OPT_VENDNAME, OPT_RPI_DEF, OPT_WRITE_EDS
+    OPT_VENDNAME, OPT_RPI_DEF, OPT_WRITE_EDS,
+    OPT_NO_EXCLUSIVE, OPT_NO_INPUT_ONLY, OPT_NO_LISTEN_ONLY
 };
 
 static void usage(const char *prog) {
@@ -935,6 +1073,9 @@ static void usage(const char *prog) {
            "  --rpi-min-ms N      reject Forward Open with RPI below N ms\n"
            "  --rpi-max-ms N      reject Forward Open with RPI above N ms\n"
            "  --timeout-ms N      override O->T inactivity timeout (else RPI*mult)\n"
+           "  --no-exclusive      do not accept Exclusive-Owner connections\n"
+           "  --no-input-only     do not accept Input-Only connections\n"
+           "  --no-listen-only    do not accept Listen-Only connections\n"
            "\nReal-time format / behaviour:\n"
            "  --no-ot-run-idle    O->T data has NO 32-bit run/idle header\n"
            "  --to-run-idle       prepend 32-bit run/idle header on T->O\n"
@@ -981,6 +1122,9 @@ int main(int argc, char **argv) {
         {"vendor-name",    required_argument, 0, OPT_VENDNAME},
         {"rev",            required_argument, 0, OPT_REV},
         {"rpi-ms",         required_argument, 0, OPT_RPI_DEF},
+        {"no-exclusive",   no_argument,       0, OPT_NO_EXCLUSIVE},
+        {"no-input-only",  no_argument,       0, OPT_NO_INPUT_ONLY},
+        {"no-listen-only", no_argument,       0, OPT_NO_LISTEN_ONLY},
         {"quiet",          no_argument,       0, 'q'},
         {"help",           no_argument,       0, 'h'},
         {0,0,0,0}
@@ -1003,6 +1147,9 @@ int main(int argc, char **argv) {
         case OPT_WRITE_EDS: eds_path = optarg; break;
         case OPT_VENDNAME: set_str(g_vendor_name, sizeof(g_vendor_name), optarg); break;
         case OPT_RPI_DEF:  g_rpi_default_us = (uint32_t)strtol(optarg, NULL, 0) * 1000; break;
+        case OPT_NO_EXCLUSIVE:   g_allow_exclusive = 0; break;
+        case OPT_NO_INPUT_ONLY:  g_allow_input_only = 0; break;
+        case OPT_NO_LISTEN_ONLY: g_allow_listen_only = 0; break;
         case 'i': g_my_ip_be = inet_addr(optarg); break;
         case 'b': g_bind_be  = inet_addr(optarg); break;
         case 'r': g_ot_run_idle = 0; break;
@@ -1065,6 +1212,10 @@ int main(int argc, char **argv) {
            EIP_TCP_PORT, EIP_UDP_PORT, EIP_IO_PORT);
     logmsg("  assemblies: O->T(out)=%u T->O(in)=%u config=%u",
            g_out_inst, g_in_inst, g_cfg_inst);
+    logmsg("  accepted connections:%s%s%s",
+           g_allow_exclusive   ? " Exclusive-Owner" : "",
+           g_allow_input_only  ? " Input-Only" : "",
+           g_allow_listen_only ? " Listen-Only" : "");
     logmsg("  O->T run/idle=%d  T->O run/idle=%d  loopback=%d",
            g_ot_run_idle, g_to_run_idle, g_loopback);
     if (g_exp_out_size || g_exp_in_size)
@@ -1196,9 +1347,10 @@ int main(int argc, char **argv) {
 
             if (cc->timeout_us &&
                 ts_diff_us(&now, &cc->last_recv) > (long)cc->timeout_us) {
-                logmsg("Connection 0x%08x timed out (no O->T for %u us)",
-                       cc->ot_conn_id, cc->timeout_us);
+                logmsg("Connection 0x%08x [%s] timed out (no O->T for %u us)",
+                       cc->ot_conn_id, kind_name(cc->kind), cc->timeout_us);
                 cc->active = 0;
+                drop_orphan_listeners();
                 continue;
             }
             if (ts_diff_us(&now, &cc->next_send) >= 0) {

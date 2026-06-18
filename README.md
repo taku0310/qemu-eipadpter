@@ -244,6 +244,51 @@ Network Connection Parameters から動的に決まり、`--out-size`/`--in-size
 
 ---
 
+## 接続種別 / Connection types
+
+Class 1 のアプリケーション接続には 3 種類があり、Forward Open の接続パラメータ
+（O→T / T→O の connection type とサイズ）から自動判定します。
+
+| 種別 | O→T（出力） | T→O（入力） | 説明 |
+|---|---|---|---|
+| **Exclusive-Owner** | データ (P2P) | 生産 | 出力を所有。1 台のみ。再 Open は同一可 |
+| **Input-Only** | ハートビート (Null/0B) | 生産 | 入力のみ受信。出力は持たない。複数可 |
+| **Listen-Only** | ハートビート (Null/0B) | 生産 (Multicast) | 既存の producer が生産する入力を傍受。producer 必須 |
+
+判定ロジック:
+- O→T が Null または 0 バイト → 非所有（ハートビート）→ T→O が Multicast なら
+  **Listen-Only**、それ以外は **Input-Only**
+- O→T が実データ → **Exclusive-Owner**
+
+セマンティクス:
+- **Exclusive-Owner** は 1 つだけ。2 つ目は `0x0106`（所有権競合）で拒否
+- **Listen-Only** は producer（Exclusive-Owner か Input-Only）が無いと `0x0119` で拒否。
+  全 producer が閉じると Listen-Only も自動切断
+- 出力イメージは Exclusive-Owner の O→T のみが更新し、入力イメージは全 T→O 消費者へ
+  共通に生産されます（複数消費者モデル）
+
+受理する種別は設定で制限できます（拒否時は `0x0103`）:
+
+```sh
+./eip_adapter --no-input-only --no-listen-only     # Exclusive-Owner のみ受理
+```
+
+設定ファイルでは `allow_exclusive` / `allow_input_only` / `allow_listen_only`。
+
+テストツールでの各種別の指定:
+
+```sh
+python3 tools/eip_originator.py --conn-type exclusive   --local 127.0.0.2
+python3 tools/eip_originator.py --conn-type input-only   --local 127.0.0.2 --serial 0x02 --ot-cid 0x12340002
+# Listen-Only は producer が居る状態で（別オリジネータを並行起動、別ローカルIP）
+python3 tools/eip_originator.py --conn-type listen-only   --local 127.0.0.3 --serial 0x03 --ot-cid 0x12340003
+```
+
+> 注: 本実装は T→O を各消費者へユニキャスト送信します（真のマルチキャスト生産は
+> 未対応ですが、Listen-Only の動作確認には十分です）。
+
+---
+
 ## 設定ファイル / Configuration file
 
 すべての設定を INI 形式のファイルにまとめられます（`config/adapter.conf` がサンプル）。
@@ -289,8 +334,9 @@ make eds CONFIG=config/adapter.conf EDS=out.eds
 ```
 
 生成される EDS には `[File]` `[Device]` `[Device Classification]` `[Params]`
-`[Assembly]` `[Connection Manager]` セクションが含まれ、Class 1（Exclusive Owner）
-接続定義（O→T / T→O のサイズ・RPI・接続パス）が記述されます。
+`[Assembly]` `[Connection Manager]` セクションが含まれ、受理する各接続種別
+（Exclusive-Owner / Input-Only / Listen-Only）の Class 1 接続定義（O→T / T→O の
+サイズ・RPI・接続パス）が記述されます（`--no-*` で除外した種別は出力されません）。
 
 > 注: EDS の細かなフィールド（Connection の trigger/transport ビットなど）は
 > 一般的な Exclusive Owner テンプレートに基づいています。製品化の際は EZ-EDS 等の
@@ -315,8 +361,8 @@ Makefile
 
 ## 制限 / Notes & limitations
 
-- 単一の I/O 接続を主用途とし、最大 8 接続まで保持します。
-- T→O は point-to-point ユニキャスト送信です（マルチキャスト生産は未対応）。
-- 接続パスのアセンブリ番号は解析・ログ出力しますが、I/O 自体は単一の
-  入出力イメージにマッピングします。
+- Exclusive-Owner / Input-Only / Listen-Only に対応し、最大 8 接続まで同時保持します。
+- T→O は各消費者へ point-to-point ユニキャスト送信です（真のマルチキャスト生産は未対応）。
+- デバイスは単一の入出力イメージを持ち、出力は Exclusive-Owner のみが更新、入力は
+  全 T→O 消費者へ共通に生産します。接続パスのアセンブリ番号は解析・ログ出力します。
 - 教育 / 検証用途を想定した軽量実装であり、ODVA 認証取得品ではありません。

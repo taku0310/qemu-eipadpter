@@ -67,9 +67,17 @@ def conn_params(size, point_to_point=True):
     return p
 
 
+# connection type codes for network connection parameters
+CT_NULL, CT_MULTICAST, CT_P2P = 0, 1, 2
+
+
+def conn_params_typed(size, ctype):
+    return (size & 0x1FF) | (ctype << 13)
+
+
 def forward_open(sock, session, ot_cid, ot_rpi_us, to_rpi_us,
                  ot_size, to_size, serial, vid, osn,
-                 cfg_inst, out_inst, in_inst):
+                 cfg_inst, out_inst, in_inst, ot_type=CT_P2P, to_type=CT_P2P):
     # CIP Message Router request: service 0x54 to Connection Manager (class 6, inst 1)
     mr = bytes([0x54, 0x02, 0x20, 0x06, 0x24, 0x01])
     fo = b""
@@ -81,9 +89,9 @@ def forward_open(sock, session, ot_cid, ot_rpi_us, to_rpi_us,
     fo += struct.pack("<I", osn)              # originator serial number
     fo += bytes([0x00, 0x00, 0x00, 0x00])     # timeout mult + 3 reserved
     fo += struct.pack("<I", ot_rpi_us)        # O->T RPI
-    fo += struct.pack("<H", conn_params(ot_size))
+    fo += struct.pack("<H", conn_params_typed(ot_size, ot_type))
     fo += struct.pack("<I", to_rpi_us)        # T->O RPI
-    fo += struct.pack("<H", conn_params(to_size))
+    fo += struct.pack("<H", conn_params_typed(to_size, to_type))
     fo += bytes([0x01])                       # transport type/trigger: class 1, cyclic
     # connection path: Assembly(4) / config / O->T / T->O
     path = bytes([0x20, 0x04, 0x24, cfg_inst, 0x2C, out_inst, 0x2C, in_inst])
@@ -181,12 +189,27 @@ def main():
     ap.add_argument("--cfg-inst", type=int, default=0x97)
     ap.add_argument("--out-inst", type=int, default=0x96)
     ap.add_argument("--in-inst", type=int, default=0x64)
+    ap.add_argument("--conn-type", default="exclusive",
+                    choices=["exclusive", "input-only", "listen-only"])
+    ap.add_argument("--serial", type=lambda x: int(x, 0), default=0x0001,
+                    help="connection serial number (unique per concurrent originator)")
+    ap.add_argument("--ot-cid", type=lambda x: int(x, 0), default=0x12340001,
+                    help="O->T connection id (unique per concurrent originator)")
     args = ap.parse_args()
 
     rpi_us = args.rpi_ms * 1000
-    serial, vid, osn = 0x0001, 0x00FF, 0x12345678
-    ot_cid = 0x12340001
+    serial, vid, osn = args.serial, 0x00FF, 0x12345678
+    ot_cid = args.ot_cid
     run_idle = not args.no_ot_run_idle
+
+    # connection-type specific parameters
+    if args.conn_type == "exclusive":
+        ot_type, ot_size, to_type = CT_P2P, args.ot_size, CT_P2P
+    elif args.conn_type == "input-only":
+        ot_type, ot_size, to_type = CT_NULL, 0, CT_P2P       # heartbeat O->T
+    else:  # listen-only (joins shared multicast T->O)
+        ot_type, ot_size, to_type = CT_NULL, 0, CT_MULTICAST
+    heartbeat_only = (ot_size == 0)
 
     # TCP session
     tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -197,9 +220,11 @@ def main():
     print("RegisterSession OK, handle=0x%08x" % session)
 
     ot_id, to_id = forward_open(
-        tcp, session, ot_cid, rpi_us, rpi_us, args.ot_size, args.to_size,
-        serial, vid, osn, args.cfg_inst, args.out_inst, args.in_inst)
-    print("ForwardOpen OK: O->T id=0x%08x  T->O id=0x%08x" % (ot_id, to_id))
+        tcp, session, ot_cid, rpi_us, rpi_us, ot_size, args.to_size,
+        serial, vid, osn, args.cfg_inst, args.out_inst, args.in_inst,
+        ot_type=ot_type, to_type=to_type)
+    print("ForwardOpen OK [%s]: O->T id=0x%08x  T->O id=0x%08x"
+          % (args.conn_type, ot_id, to_id))
 
     # UDP I/O socket bound to our distinct local address
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -220,9 +245,13 @@ def main():
         if now >= next_send:
             seq32 += 1
             seq16 = (seq16 + 1) & 0xFFFF
-            out_counter = (out_counter + 1) & 0xFFFFFFFF
-            payload = struct.pack("<I", out_counter) + b"\xAA" * (args.ot_size - 4)
-            pkt = build_io_packet(ot_id, seq32, seq16, payload[:args.ot_size], run_idle)
+            if heartbeat_only:
+                # Input-Only / Listen-Only: O->T is a null heartbeat (keep-alive)
+                pkt = build_io_packet(ot_id, seq32, seq16, b"", run_idle=False)
+            else:
+                out_counter = (out_counter + 1) & 0xFFFFFFFF
+                payload = struct.pack("<I", out_counter) + b"\xAA" * (args.ot_size - 4)
+                pkt = build_io_packet(ot_id, seq32, seq16, payload[:args.ot_size], run_idle)
             udp.sendto(pkt, (args.adapter, IO_PORT))
             next_send += rpi_us / 1e6
 
@@ -241,17 +270,17 @@ def main():
         produced = last_to[2:]
         hb = struct.unpack_from("<I", produced, 0)[0] if len(produced) >= 4 else 0
         print("Last T->O heartbeat counter = %d" % hb)
-        # produced[4:] is the looped-back O->T image: <O->T counter><0xAA...>
-        looped = produced[4:4 + args.ot_size]
-        looped_ctr = struct.unpack_from("<I", looped, 0)[0] if len(looped) >= 4 else 0
-        loop = looped[:8].hex()
-        print("Last T->O loopback bytes[0:8] = %s" % loop)
-        # off-by-one vs out_counter is normal (last T->O produced just before our
-        # final O->T was consumed); accept a small lag and verify the 0xAA fill.
-        ctr_ok = abs(out_counter - looped_ctr) <= 2
-        fill_ok = all(b == 0xAA for b in looped[4:])
-        print("Loopback OK: %s (embedded O->T counter=%d, ours=%d)"
-              % ("YES" if (ctr_ok and fill_ok) else "no", looped_ctr, out_counter))
+        if not heartbeat_only:
+            # produced[4:] is the looped-back O->T image: <O->T counter><0xAA...>
+            looped = produced[4:4 + args.ot_size]
+            looped_ctr = struct.unpack_from("<I", looped, 0)[0] if len(looped) >= 4 else 0
+            print("Last T->O loopback bytes[0:8] = %s" % looped[:8].hex())
+            ctr_ok = abs(out_counter - looped_ctr) <= 2
+            fill_ok = all(b == 0xAA for b in looped[4:])
+            print("Loopback OK: %s (embedded O->T counter=%d, ours=%d)"
+                  % ("YES" if (ctr_ok and fill_ok) else "no", looped_ctr, out_counter))
+        else:
+            print("(%s: input data received; no owned outputs)" % args.conn_type)
 
     forward_close(tcp, session, serial, vid, osn,
                   args.cfg_inst, args.out_inst, args.in_inst)
