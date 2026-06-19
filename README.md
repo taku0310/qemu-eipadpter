@@ -1,14 +1,18 @@
 # qemu-eipadpter
 
-Ubuntu / Linux ホスト上で動作する **EtherNet/IP アダプタ（CIP ターゲット機器）**
-アプリケーションです。オリジネータ（PLC / スキャナ / ソフト PLC）からの
-**Class 1（インプリシット / 周期 I/O）通信**を受け付け、リアルタイムにデータを
-交換します。
+Ubuntu / Linux ホスト上で動作する **EtherNet/IP アプリケーション**一式です。
+**Class 1（インプリシット / 周期 I/O）通信**を行う、対になる 2 つのアプリを含みます:
 
-An EtherNet/IP adapter (CIP target) that runs as an ordinary userspace program
-on an **Ubuntu/Linux host** and exchanges **Class 1 (implicit, cyclic) I/O**
-data with an originator (PLC / scanner). It uses the well-known ports
-TCP/UDP 44818 and UDP 2222, all of which are unprivileged — **no root needed**.
+- **`eip_adapter`** — アダプタ（CIP ターゲット機器）。スキャナ/PLC からの接続を受ける側
+- **`eip_scanner`** — スキャナ（CIP オリジネータ）。アダプタへ接続して I/O を駆動する側
+
+両者は相互通信でき、本リポジトリ単体で Class 1 通信を完結・検証できます。
+
+Two paired EtherNet/IP applications that run as ordinary userspace programs on an
+**Ubuntu/Linux host** and perform **Class 1 (implicit, cyclic) I/O**: `eip_adapter`
+(CIP target) and `eip_scanner` (CIP originator). They interoperate with each
+other. The well-known ports (TCP/UDP 44818, UDP 2222) are unprivileged —
+**no root needed**.
 
 > 履歴上リポジトリ名は `qemu-eipadpter` ですが、本アプリは QEMU を必要とせず、
 > ホスト OS（Ubuntu）上で直接動作します。
@@ -108,6 +112,62 @@ Forward Open → UDP I/O 周期交換 → Forward Close を行い、ループバ
 
 ---
 
+## スキャナ（オリジネータ）アプリ / Scanner application
+
+本リポジトリには、アダプタと対になる **C 製の EtherNet/IP スキャナ
+`eip_scanner`**（オリジネータ）も含まれます。Class 1 接続を開いて周期 I/O を
+実行し、本アダプタと相互通信できます。
+
+```sh
+make                               # eip_adapter と eip_scanner を両方ビルド
+./eip_scanner --target 192.168.1.50            # 既定: exclusive, 32/32B, RPI 50ms
+```
+
+主なオプション（`./eip_scanner --help` で全一覧）:
+
+```
+  --target IP        接続先アダプタ IP                        [必須]
+  --local IP         送信元 IP（同一ホスト検証用）
+  --conn-type T      exclusive | input-only | listen-only      [exclusive]
+  --to-multicast     T→O をマルチキャストで要求
+  --ot-size / --to-size   O→T / T→O バイト数                  [32 / 32]
+  --rpi-ms N         要求 RPI（ミリ秒）                        [50]
+  --out-inst/--in-inst/--cfg-inst   アセンブリ番号            [150/100/151]
+  --no-ot-run-idle / --to-run-idle  run/idle ヘッダ
+  --serial/--ot-cid  接続識別（複数スキャナ並行時に個別指定）
+  --seconds N        実行時間（0 = 無限）                      [0]
+```
+
+### スキャナ ↔ アダプタ 相互通信（同一ホストでの確認）
+
+UDP/2222 を双方向に使うため、同一ホストではスキャナに別 IP（`127.0.0.2`）を割当てます。
+
+```sh
+# 端末1: アダプタ
+./eip_adapter --ip 127.0.0.1
+
+# 端末2: スキャナ（exclusive, ユニキャスト）
+./eip_scanner --target 127.0.0.1 --local 127.0.0.2 --rpi-ms 50
+
+# マルチキャスト共有: owner と listen-only を別 IP で並行起動
+./eip_scanner --target 127.0.0.1 --local 127.0.0.2 --to-multicast \
+    --serial 0x01 --ot-cid 0x12340001 &
+./eip_scanner --target 127.0.0.1 --local 127.0.0.3 --conn-type listen-only \
+    --serial 0x03 --ot-cid 0x12340003
+```
+
+スキャナは毎秒ステータス（送受信数・受信した入力データ先頭）を出力します:
+
+```
+Forward Open OK [exclusive]: O->T id=0x12340001  T->O id=0x20000001
+status: O->T sent=20  T->O recv=21  last input[0:4]=21
+```
+
+別ホストの実機どうしでも、同一サブネットにあれば `--target` を相手 IP にするだけで
+通信できます（`--local` は省略可）。
+
+---
+
 ## サービスとして常駐 / Install as a systemd service
 
 ```sh
@@ -118,7 +178,7 @@ sudo systemctl status eip-adapter
 journalctl -u eip-adapter -f          # ログ
 ```
 
-- バイナリ → `/usr/local/bin/eip_adapter`
+- バイナリ → `/usr/local/bin/eip_adapter`, `/usr/local/bin/eip_scanner`
 - 設定 → `/etc/eip-adapter/adapter.conf`（既存があれば上書きしません）
 - ユニット → `/lib/systemd/system/eip-adapter.service`
 
@@ -273,7 +333,8 @@ make eds                                   # -> Linux_EIP_Adapter.eds
 ```
 src/eip.h                 エンキャプスュレーション / CIP 定数, エンディアン補助
 src/device.h              機器アイデンティティ / アセンブリ定義
-src/eip_adapter.c         本体（TCP/UDP サーバ + Class 1 I/O + 設定 / EDS 生成）
+src/eip_adapter.c         アダプタ本体（TCP/UDP サーバ + Class 1 I/O + 設定 / EDS 生成）
+src/eip_scanner.c         スキャナ本体（オリジネータ、Class 1 I/O）
 config/adapter.conf       設定ファイルのサンプル
 packaging/eip-adapter.service  systemd ユニット
 tools/eip_originator.py   テスト用オリジネータ（スキャナ）

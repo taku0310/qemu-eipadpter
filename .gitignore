@@ -1,5 +1,6 @@
 # build artifacts
 /eip_adapter
+/eip_scanner
 /build/
 *.o
 *.cpio.gz
