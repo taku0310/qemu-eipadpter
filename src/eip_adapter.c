@@ -70,6 +70,9 @@ static uint32_t g_rpi_max_us = 0;
 /* ---- inactivity timeout override (microseconds): 0 = derive from FO ---- */
 static uint32_t g_timeout_us = 0;
 
+/* ---- idle TCP encapsulation-session timeout (us): 0 = disabled ---- */
+static uint32_t g_tcp_idle_us = 0;
+
 /* ---- Identity object (runtime-configurable; defaults from device.h) ---- */
 static uint16_t g_vendor_id    = DEV_VENDOR_ID;
 static uint16_t g_device_type  = DEV_DEVICE_TYPE;
@@ -315,6 +318,7 @@ static int handle_explicit(uint8_t service, uint16_t class_id, uint32_t inst,
         if (service == CIP_GET_ATTR_SINGLE && attr == 3) {
             if (inst == g_in_inst) {
                 uint16_t sz = g_exp_in_size ? g_exp_in_size : ASM_INPUT_SIZE;
+                if (sz > sizeof(g_out_image)) sz = sizeof(g_out_image);  /* bound response */
                 build_input_image(p, sz); p += sz;
             } else {
                 memcpy(p, g_out_image, g_out_len); p += g_out_len;
@@ -350,15 +354,46 @@ static void parse_epath(const uint8_t *p, int words, epath_t *ep) {
     while (i < len) {
         uint8_t seg = p[i++];
         switch (seg) {
-        case 0x20: ep->class_id = p[i++]; break;                 /* 8-bit class    */
-        case 0x21: i++; ep->class_id = get_u16(p + i); i += 2; break; /* 16-bit class */
-        case 0x24: if (ep->n_points < 4) ep->conn_points[ep->n_points++] = p[i]; i++; break;
-        case 0x25: i++; if (ep->n_points < 4) ep->conn_points[ep->n_points++] = get_u16(p+i); i += 2; break;
-        case 0x2C: if (ep->n_points < 4) ep->conn_points[ep->n_points++] = p[i]; i++; break;
-        case 0x2D: i++; if (ep->n_points < 4) ep->conn_points[ep->n_points++] = get_u16(p+i); i += 2; break;
-        case 0x30: i++; break;                                    /* 8-bit attribute */
-        case 0x80:                                                /* data segment    */
-            { uint8_t dl = p[i++]; i += dl * 2; } break;
+        case 0x20:   /* 8-bit class */
+            if (i + 1 > len) return;
+            ep->class_id = p[i];
+            i += 1;
+            break;
+        case 0x21:   /* 16-bit class (segment + pad + value) */
+            if (i + 3 > len) return;
+            ep->class_id = get_u16(p + i + 1);
+            i += 3;
+            break;
+        case 0x24:   /* 8-bit instance */
+            if (i + 1 > len) return;
+            if (ep->n_points < 4) ep->conn_points[ep->n_points++] = p[i];
+            i += 1;
+            break;
+        case 0x25:   /* 16-bit instance */
+            if (i + 3 > len) return;
+            if (ep->n_points < 4) ep->conn_points[ep->n_points++] = get_u16(p + i + 1);
+            i += 3;
+            break;
+        case 0x2C:   /* 8-bit connection point */
+            if (i + 1 > len) return;
+            if (ep->n_points < 4) ep->conn_points[ep->n_points++] = p[i];
+            i += 1;
+            break;
+        case 0x2D:   /* 16-bit connection point */
+            if (i + 3 > len) return;
+            if (ep->n_points < 4) ep->conn_points[ep->n_points++] = get_u16(p + i + 1);
+            i += 3;
+            break;
+        case 0x30:   /* 8-bit attribute */
+            if (i + 1 > len) return;
+            i += 1;
+            break;
+        case 0x80: { /* data segment */
+            if (i + 1 > len) return;
+            uint8_t dl = p[i];
+            i += 1 + dl * 2;
+            break;
+        }
         default:
             /* unknown segment: bail out to avoid runaway parsing */
             i = len;
@@ -440,6 +475,13 @@ static int fo_error(int large, uint16_t ext, uint16_t serial,
 static int do_forward_open(int large, const uint8_t *d, int dl,
                            struct in_addr peer_ip, uint8_t *resp)
 {
+    /* fixed portion before the connection path: 36 bytes (short) / 40 (large) */
+    int fixed = large ? 40 : 36;
+    if (dl < fixed) {   /* too short to even read serial/vid/osn for a proper error */
+        resp[0] = (large ? CIP_LARGE_FORWARD_OPEN : CIP_FORWARD_OPEN) | CIP_REPLY_MASK;
+        resp[1] = 0; resp[2] = 0x20; resp[3] = 0;   /* general status: invalid parameter */
+        return 4;
+    }
     const uint8_t *p = d;
     uint8_t  priority_tick = *p++;
     uint8_t  timeout_ticks = *p++;
@@ -457,9 +499,13 @@ static int do_forward_open(int large, const uint8_t *d, int dl,
     uint32_t to_par = large ? get_u32(p) : get_u16(p); p += large ? 4 : 2;
     uint8_t  ttt    = *p++;                       /* transport type/trigger */
     uint8_t  path_words = *p++;
+    if (dl < fixed + path_words * 2) {   /* connection path runs past the request */
+        logmsg("Forward Open rejected: truncated connection path");
+        return fo_error(large, CM_EXT_CONN_TYPE_UNSUP, serial, vid, osn, resp);
+    }
     epath_t ep;
     parse_epath(p, path_words, &ep);
-    (void)dl; (void)ttt; (void)timeout_ticks;
+    (void)ttt; (void)timeout_ticks;
 
     uint16_t ot_size = conn_param_size(ot_par, large);
     uint16_t to_size = conn_param_size(to_par, large);
@@ -619,11 +665,15 @@ static int do_forward_open(int large, const uint8_t *d, int dl,
 }
 
 static int do_forward_close(const uint8_t *d, int dl, uint8_t *resp) {
+    if (dl < 10) {   /* priority(1)+ticks(1)+serial(2)+vid(2)+osn(4) */
+        resp[0] = CIP_FORWARD_CLOSE | CIP_REPLY_MASK;
+        resp[1] = 0; resp[2] = 0x20; resp[3] = 0;   /* invalid parameter */
+        return 4;
+    }
     const uint8_t *p = d + 2;          /* skip priority/tick + timeout_ticks */
     uint16_t serial = get_u16(p); p += 2;
     uint16_t vid    = get_u16(p); p += 2;
     uint32_t osn    = get_u32(p); p += 4;
-    (void)dl;
 
     conn_t *c = conn_find_by_serial(serial, vid, osn);
     if (c) {
@@ -656,6 +706,7 @@ static int handle_mr(const uint8_t *mr, int mr_len, struct in_addr peer_ip, uint
     if (mr_len < 2) return 0;
     uint8_t service   = mr[0];
     uint8_t path_words = mr[1];
+    if (2 + path_words * 2 > mr_len) return 0;   /* path must fit within the request */
     const uint8_t *path = mr + 2;
     epath_t ep;
     parse_epath(path, path_words, &ep);
@@ -685,6 +736,7 @@ typedef struct {
     struct in_addr peer_ip;
     uint8_t  rx[BUF_SIZE];
     int      rx_len;
+    struct timespec last_activity;
 } tcp_client_t;
 
 static uint32_t g_next_session = 0x00010000;
@@ -766,13 +818,18 @@ static int process_encap(tcp_client_t *cl, const uint8_t *msg, int msg_len, uint
         break;
     }
     case ENCAP_SEND_RR_DATA: {
-        /* interface handle(4) + timeout(2) + CPF */
+        /* interface handle(4) + timeout(2) + CPF item count(2) */
+        if (data_len < 8) { rh.status = ENCAP_STATUS_INVALID_LENGTH; break; }
+        const uint8_t *frame_end = data + data_len;
         const uint8_t *cpf = data + 6;
         uint16_t item_count = get_u16(cpf); cpf += 2;
         const uint8_t *mr = NULL; int mr_len = 0;
         for (uint16_t i = 0; i < item_count; i++) {
+            if (cpf + 4 > frame_end) break;          /* need type(2)+len(2)        */
             uint16_t type = get_u16(cpf); cpf += 2;
             uint16_t len  = get_u16(cpf); cpf += 2;
+            if (cpf + len > frame_end)               /* clamp to remaining frame   */
+                len = (uint16_t)(frame_end - cpf);
             if (type == CPF_UNCONNECTED_DATA) { mr = cpf; mr_len = len; }
             cpf += len;
         }
@@ -890,6 +947,8 @@ static void io_consume(const uint8_t *pkt, int len) {
     for (uint16_t i = 0; i < items && (p - pkt) + 4 <= len; i++) {
         uint16_t type = get_u16(p); p += 2;
         uint16_t ilen = get_u16(p); p += 2;
+        int avail = len - (int)(p - pkt);
+        if (ilen > avail) ilen = (uint16_t)avail;    /* never read past the packet */
         if (type == CPF_SEQUENCED_ADDRESS && ilen >= 8) {
             conn_id = get_u32(p);
         } else if (type == CPF_CONNECTED_ADDRESS && ilen >= 4) {
@@ -984,6 +1043,7 @@ static int set_param(const char *k, const char *v) {
     else if (!strcmp(k, "rpi_max_ms"))   g_rpi_max_us = (uint32_t)strtol(v, NULL, 0) * 1000;
     else if (!strcmp(k, "rpi_ms"))       g_rpi_default_us = (uint32_t)strtol(v, NULL, 0) * 1000;
     else if (!strcmp(k, "timeout_ms"))   g_timeout_us = (uint32_t)strtol(v, NULL, 0) * 1000;
+    else if (!strcmp(k, "tcp_timeout_ms")) g_tcp_idle_us = (uint32_t)strtol(v, NULL, 0) * 1000;
     else if (!strcmp(k, "ot_run_idle"))  g_ot_run_idle = atoi(v);
     else if (!strcmp(k, "to_run_idle"))  g_to_run_idle = atoi(v);
     else if (!strcmp(k, "loopback"))     g_loopback = atoi(v);
@@ -1168,7 +1228,7 @@ enum {
     OPT_RPI_MIN, OPT_RPI_MAX, OPT_TIMEOUT,
     OPT_VENDOR, OPT_DEVTYPE, OPT_PRODCODE, OPT_SERIAL, OPT_NAME, OPT_REV,
     OPT_VENDNAME, OPT_RPI_DEF, OPT_WRITE_EDS,
-    OPT_NO_EXCLUSIVE, OPT_NO_INPUT_ONLY, OPT_NO_LISTEN_ONLY
+    OPT_NO_EXCLUSIVE, OPT_NO_INPUT_ONLY, OPT_NO_LISTEN_ONLY, OPT_TCP_TIMEOUT
 };
 
 static void usage(const char *prog) {
@@ -1190,6 +1250,7 @@ static void usage(const char *prog) {
            "  --rpi-min-ms N      reject Forward Open with RPI below N ms\n"
            "  --rpi-max-ms N      reject Forward Open with RPI above N ms\n"
            "  --timeout-ms N      override O->T inactivity timeout (else RPI*mult)\n"
+           "  --tcp-timeout-ms N  close idle TCP encapsulation sessions after N ms (0=off)\n"
            "  --no-exclusive      do not accept Exclusive-Owner connections\n"
            "  --no-input-only     do not accept Input-Only connections\n"
            "  --no-listen-only    do not accept Listen-Only connections\n"
@@ -1242,6 +1303,7 @@ int main(int argc, char **argv) {
         {"no-exclusive",   no_argument,       0, OPT_NO_EXCLUSIVE},
         {"no-input-only",  no_argument,       0, OPT_NO_INPUT_ONLY},
         {"no-listen-only", no_argument,       0, OPT_NO_LISTEN_ONLY},
+        {"tcp-timeout-ms", required_argument, 0, OPT_TCP_TIMEOUT},
         {"quiet",          no_argument,       0, 'q'},
         {"help",           no_argument,       0, 'h'},
         {0,0,0,0}
@@ -1267,6 +1329,7 @@ int main(int argc, char **argv) {
         case OPT_NO_EXCLUSIVE:   g_allow_exclusive = 0; break;
         case OPT_NO_INPUT_ONLY:  g_allow_input_only = 0; break;
         case OPT_NO_LISTEN_ONLY: g_allow_listen_only = 0; break;
+        case OPT_TCP_TIMEOUT:    g_tcp_idle_us = (uint32_t)strtol(optarg, NULL, 0) * 1000; break;
         case 'i': g_my_ip_be = inet_addr(optarg); break;
         case 'b': g_bind_be  = inet_addr(optarg); break;
         case 'r': g_ot_run_idle = 0; break;
@@ -1386,10 +1449,13 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < MAX_TCP_CLIENTS; i++) if (clients[i].fd < 0) { slot = i; break; }
                 if (slot < 0) { close(nfd2); }
                 else {
-                    int one = 1; setsockopt(nfd2, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                    int one = 1;
+                    setsockopt(nfd2, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                    setsockopt(nfd2, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
                     memset(&clients[slot], 0, sizeof(tcp_client_t));
                     clients[slot].fd = nfd2;
                     clients[slot].peer_ip = pa.sin_addr;
+                    now_mono(&clients[slot].last_activity);
                     if (g_my_ip_be == 0) {
                         /* learn our own IP from the local side of the socket */
                         struct sockaddr_in la; socklen_t ll = sizeof(la);
@@ -1442,6 +1508,7 @@ int main(int argc, char **argv) {
                 close(cl->fd); cl->fd = -1; continue;
             }
             cl->rx_len += n;
+            now_mono(&cl->last_activity);
 
             /* process all complete encapsulation messages in the buffer */
             int off = 0, drop = 0;
@@ -1462,8 +1529,19 @@ int main(int argc, char **argv) {
             if (drop) { close(cl->fd); cl->fd = -1; }
         }
 
-        /* --- cyclic production + timeout supervision --- */
+        /* --- close idle TCP encapsulation sessions (DoS mitigation) --- */
         now_mono(&now);
+        if (g_tcp_idle_us) {
+            for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+                if (clients[i].fd < 0) continue;
+                if (ts_diff_us(&now, &clients[i].last_activity) > (long)g_tcp_idle_us) {
+                    logmsg("TCP idle timeout %s", inet_ntoa(clients[i].peer_ip));
+                    close(clients[i].fd); clients[i].fd = -1;
+                }
+            }
+        }
+
+        /* --- cyclic production + timeout supervision --- */
         for (int i = 0; i < MAX_CONNS; i++) {
             conn_t *cc = &g_conns[i];
             if (!cc->active) continue;

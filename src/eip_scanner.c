@@ -175,13 +175,16 @@ static int parse_forward_open_reply(const uint8_t *body, int len,
                                     uint32_t *ot_id, uint32_t *to_id,
                                     uint32_t *mcast_be) {
     *mcast_be = 0;
-    const uint8_t *p = body + 6;              /* skip iface handle + timeout */
     if (len < 8) return -1;
+    const uint8_t *p = body + 6;              /* skip iface handle + timeout */
+    const uint8_t *end = body + len;
     uint16_t count = get_u16(p); p += 2;
     const uint8_t *mr = NULL; int mr_len = 0;
     for (uint16_t i = 0; i < count; i++) {
+        if (p + 4 > end) break;
         uint16_t t = get_u16(p); p += 2;
         uint16_t l = get_u16(p); p += 2;
+        if (p + l > end) l = (uint16_t)(end - p);   /* clamp to received reply */
         if (t == CPF_UNCONNECTED_DATA) { mr = p; mr_len = l; }
         else if (t == CPF_SOCKADDR_TO && l >= 8) memcpy(mcast_be, p + 4, 4);
         p += l;
@@ -189,10 +192,11 @@ static int parse_forward_open_reply(const uint8_t *body, int len,
     if (!mr || mr_len < 4) return -1;
     uint8_t gstatus = mr[2], addl = mr[3];
     if (gstatus != 0) {
-        uint16_t ext = (addl >= 1) ? get_u16(mr + 4) : 0;
+        uint16_t ext = (addl >= 1 && mr_len >= 6) ? get_u16(mr + 4) : 0;
         logmsg("Forward Open rejected: CIP status=0x%02x extended=0x%04x", gstatus, ext);
         return -1;
     }
+    if (mr_len < 12) return -1;               /* need O->T + T->O connection ids */
     *ot_id = get_u32(mr + 4);
     *to_id = get_u32(mr + 8);
     return 0;
@@ -261,6 +265,8 @@ static const uint8_t *parse_to_packet(const uint8_t *pkt, int len, int run_idle,
     for (uint16_t i = 0; i < items && (p - pkt) + 4 <= len; i++) {
         uint16_t t = get_u16(p); p += 2;
         uint16_t l = get_u16(p); p += 2;
+        int avail = len - (int)(p - pkt);
+        if (l > avail) l = (uint16_t)avail;       /* never read past the packet */
         if (t == CPF_SEQUENCED_ADDRESS && l >= 8) *conn_id = get_u32(p);
         else if (t == CPF_CONNECTED_DATA) { data = p; dl = l; }
         p += l;
