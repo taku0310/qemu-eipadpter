@@ -63,6 +63,85 @@ sudo apt-get install build-essential
 make            # -> ./eip_adapter
 ```
 
+---
+
+## Class 1 通信までの手順 / Step-by-step to Class 1 I/O
+
+最短で Class 1（周期 I/O）通信を確立する手順です。本リポジトリのアダプタとスキャナ
+だけで完結します。
+
+### A. 同一ホストで試す（2 つのループバック IP を使用）
+
+UDP/2222 を双方向に使うため、スキャナ側に別 IP（`127.0.0.2`）を割り当てて
+ポート競合を避けます。
+
+```sh
+# 1) ビルド
+make
+
+# 2) 端末1: アダプタ（ターゲット）を起動
+./eip_adapter --ip 127.0.0.1
+
+# 3) 端末2: スキャナ（オリジネータ）を起動して Class 1 接続
+./eip_scanner --target 127.0.0.1 --local 127.0.0.2 --rpi-ms 50
+```
+
+4) スキャナ側に以下が出れば**通信確立**です（毎秒ステータスが更新）:
+
+```
+RegisterSession OK, handle=0x00010000
+Forward Open OK [exclusive]: O->T id=0x12340001  T->O id=0x20000001
+Class 1 I/O started (RPI 50 ms, O->T 32B, T->O 32B)
+status: O->T sent=20  T->O recv=20  last input[0:4]=21
+```
+
+アダプタ側ログにも `Forward Open [Exclusive-Owner] ...` と接続 I/O が表示されます。
+`Ctrl-C` でスキャナを止めると Forward Close まで実行されます。
+
+### B. 2 台のホスト間（実ネットワーク）
+
+```
+[ ホストA: アダプタ 192.168.1.50 ]  ──  同一サブネット  ──  [ ホストB: スキャナ ]
+```
+
+```sh
+# ホストA（アダプタ）
+./eip_adapter --ip 192.168.1.50
+
+# ホストB（スキャナ）— --local は省略可
+./eip_scanner --target 192.168.1.50 --rpi-ms 50
+```
+
+ファイアウォール使用時は **TCP 44818 / UDP 44818 / UDP 2222** とマルチキャストを許可:
+
+```sh
+sudo ufw allow 44818
+sudo ufw allow 2222/udp
+```
+
+### C. 市販 PLC / ソフト PLC のスキャナと接続する場合
+
+1. アダプタを起動（`--ip` に NIC の IP）。
+2. PLC 側でジェネリック EtherNet/IP デバイスを追加し、**接続先 IP** をアダプタに設定。
+3. **アセンブリ番号とサイズ**を一致させる（既定: O→T=150, T→O=100, Config=151、各 32B）。
+   合わない場合はアダプタ側を `--out-inst/--in-inst/--cfg-inst`・`--out-size/--in-size`
+   で合わせるか、PLC 側を変更。EDS が必要なら `make eds` で生成して登録。
+4. 多くの PLC は O→T に 32bit run/idle ヘッダを付けます（既定で対応）。付けない場合は
+   アダプタを `--no-ot-run-idle` で起動。
+5. PLC のスキャナを開始すると Forward Open → 周期 I/O が始まります。
+
+### つまずいたら / Troubleshooting
+
+| 症状 | 対処 |
+|---|---|
+| TCP 接続できない | IP/サブネット・ファイアウォール（44818/tcp）を確認 |
+| Forward Open 拒否（`0x0127/0x0128`） | サイズ不一致 → `--out-size/--in-size` または PLC 設定を合わせる |
+| Forward Open 拒否（`0x0119`） | Listen-Only を producer（owner）無しで開いている |
+| T→O を受信しない | UDP 2222 がブロックされていないか、マルチキャストなら IGMP/同一L2 を確認 |
+| 同一ホストで T→O が来ない | スキャナの `--local` をアダプタと別 IP（例 127.0.0.2）にする |
+
+---
+
 ## Ubuntu ホストで実行 / Run on the host
 
 ```sh
