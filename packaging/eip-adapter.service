@@ -1,0 +1,22 @@
+[Unit]
+Description=EtherNet/IP Class 1 Adapter
+Documentation=https://github.com/taku0310/qemu-eipadpter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Edit /etc/eip-adapter/adapter.conf to set the NIC IP (ip=), I/O sizes, etc.
+ExecStart=/usr/local/bin/eip_adapter --config /etc/eip-adapter/adapter.conf
+Restart=on-failure
+RestartSec=2
+
+# Ports 44818/2222 are unprivileged, so no root or extra capabilities needed.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
