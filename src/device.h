@@ -14,7 +14,7 @@
 #define DEV_REV_MINOR    1
 #define DEV_STATUS       0x0030          /* owned + configured-ish; informational */
 #define DEV_SERIAL       0x00C0FFEE
-#define DEV_PRODUCT_NAME "QEMU EIP Adapter"
+#define DEV_PRODUCT_NAME "Linux EIP Adapter"
 
 /* Default Assembly instances (overridable on the command line) */
 #define ASM_CONFIG_INST   0x97   /* 151 - configuration */
